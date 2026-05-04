@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=8192,
         help="Default max_tokens for the Anthropic provider. Defaults to 8192.",
     )
+    parser.add_argument(
+        "--prompt",
+        help="Run a single non-interactive job with the given prompt and exit.",
+    )
     return parser
 
 
@@ -277,7 +281,75 @@ def _usage_text(
     return f"{usage.input:,} in / {usage.output:,} out | session: {total_input:,} in / {total_output:,} out"
 
 
-async def _main(chat_provider: ChatProvider) -> None:
+async def _run_request(
+    chat_provider: ChatProvider,
+    toolset: SimpleToolset,
+    history: list[Message],
+    user_input: str,
+) -> list[Message]:
+    original_user_message = Message(role="user", content=user_input)
+    history.append(original_user_message)
+    carryover_requested = False
+    total_input = 0
+    total_output = 0
+
+    while True:
+        with console.status("[dim]Thinking...[/dim]", spinner="dots"):
+            step_result = await kosong.step(
+                chat_provider=chat_provider,
+                toolset=toolset,
+                history=history,
+                system_prompt=SYSTEM_PROMPT.format(cwd=os.getcwd()),
+            )
+        history.append(step_result.message)
+
+        if step_result.usage:
+            total_input += step_result.usage.input
+            total_output += step_result.usage.output
+
+        tool_results = await step_result.tool_results()
+        history.extend(tool_result_to_message(result) for result in tool_results)
+
+        if carryover_requested:
+            history = [
+                original_user_message,
+                step_result.message,
+                *(tool_result_to_message(result) for result in tool_results),
+            ]
+            carryover_requested = False
+            total_input = 0
+            total_output = 0
+            console.print(
+                "[dim]Carryover cell saved; chat history reset for the next iteration.[/dim]"
+            )
+            continue
+
+        if total_input + total_output >= CARRYOVER_THRESHOLD_TOKENS:
+            history.append(Message(role="user", content=CARRYOVER_INSTRUCTION))
+            carryover_requested = True
+            console.print(
+                f"[dim]Context threshold reached "
+                f"({total_input + total_output:,}/"
+                f"{CARRYOVER_THRESHOLD_TOKENS:,} tokens); requesting carryover cell.[/dim]"
+            )
+            continue
+
+        if len(tool_results) == 0:
+            subtitle = _usage_text(step_result.usage, total_input, total_output)
+            print_block(
+                "Assistant",
+                Markdown(step_result.message.extract_text()),
+                "blue",
+                subtitle=subtitle,
+            )
+            return history
+
+        console.print(
+            f"[dim]{_usage_text(step_result.usage, total_input, total_output)}[/dim]"
+        )
+
+
+async def _main(chat_provider: ChatProvider, prompt: str | None = None) -> None:
     history: list[Message] = []
 
     toolset = SimpleToolset()
@@ -288,72 +360,17 @@ async def _main(chat_provider: ChatProvider) -> None:
         f"{chat_provider.model_name}.[/dim]"
     )
 
+    if prompt is not None:
+        await _run_request(chat_provider, toolset, history, prompt)
+        return
+
     while True:
         user_input = ask_user()
         if user_input is None:
             console.print("[dim]Bye[/dim]")
             break
 
-        original_user_message = Message(role="user", content=user_input)
-        history.append(original_user_message)
-        carryover_requested = False
-        total_input = 0
-        total_output = 0
-
-        while True:
-            with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-                step_result = await kosong.step(
-                    chat_provider=chat_provider,
-                    toolset=toolset,
-                    history=history,
-                    system_prompt=SYSTEM_PROMPT.format(cwd=os.getcwd()),
-                )
-            history.append(step_result.message)
-
-            if step_result.usage:
-                total_input += step_result.usage.input
-                total_output += step_result.usage.output
-
-            tool_results = await step_result.tool_results()
-            history.extend(tool_result_to_message(result) for result in tool_results)
-
-            if carryover_requested:
-                history = [
-                    original_user_message,
-                    step_result.message,
-                    *(tool_result_to_message(result) for result in tool_results),
-                ]
-                carryover_requested = False
-                total_input = 0
-                total_output = 0
-                console.print(
-                    "[dim]Carryover cell saved; chat history reset for the next iteration.[/dim]"
-                )
-                continue
-
-            if total_input + total_output >= CARRYOVER_THRESHOLD_TOKENS:
-                history.append(Message(role="user", content=CARRYOVER_INSTRUCTION))
-                carryover_requested = True
-                console.print(
-                    f"[dim]Context threshold reached "
-                    f"({total_input + total_output:,}/"
-                    f"{CARRYOVER_THRESHOLD_TOKENS:,} tokens); requesting carryover cell.[/dim]"
-                )
-                continue
-
-            if len(tool_results) == 0:
-                subtitle = _usage_text(step_result.usage, total_input, total_output)
-                print_block(
-                    "Assistant",
-                    Markdown(step_result.message.extract_text()),
-                    "blue",
-                    subtitle=subtitle,
-                )
-                break
-            else:
-                console.print(
-                    f"[dim]{_usage_text(step_result.usage, total_input, total_output)}[/dim]"
-                )
+        history = await _run_request(chat_provider, toolset, history, user_input)
 
 
 def main() -> None:
@@ -366,6 +383,6 @@ def main() -> None:
         parser.error(str(exc))
 
     try:
-        asyncio.run(_main(chat_provider))
+        asyncio.run(_main(chat_provider, prompt=args.prompt))
     except KeyboardInterrupt:
         console.print("\n[dim]Bye[/dim]")

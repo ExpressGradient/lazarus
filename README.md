@@ -48,6 +48,12 @@ Quit the CLI with:
 /quit
 ```
 
+Run a single non-interactive job and exit:
+
+```sh
+lazarus --prompt "summarize this repository"
+```
+
 ## Providers And Models
 
 Lazarus defaults to the Kimi provider with `kimi-k2.6`:
@@ -95,6 +101,7 @@ export KIMI_BASE_URL=https://api.moonshot.ai/v1
 --no-stream              Disable provider streaming.
 --thinking-effort        Reasoning effort: off, low, medium, high, xhigh, or max.
 --anthropic-max-tokens   Default max_tokens for Anthropic. Defaults to 8192.
+--prompt                 Run one non-interactive request and exit.
 ```
 
 ## How The Agent Works
