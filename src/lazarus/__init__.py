@@ -1,0 +1,1 @@
+"""Lazarus CLI package."""

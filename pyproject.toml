@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lazarus"
+version = "0.1.0"
+description = "A terminal coding agent with persistent Python tools and carryover"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+    { name = "Sai Praneeth Diddigam", email = "hi@saipraneeth.in" },
+]
+dependencies = [
+    "kosong[contrib]>=0.53.0",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+lazarus = "lazarus.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ExpressGradient/lazarus"
+Repository = "https://github.com/ExpressGradient/lazarus"
