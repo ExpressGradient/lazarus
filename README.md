@@ -129,8 +129,14 @@ The agent is expected to use Python for workspace actions, including:
 ## Carryover
 
 Lazarus tracks token usage during each user request. When the accumulated input
-and output usage for that request reaches `100,000` tokens, Lazarus injects an
-internal carryover instruction into the conversation.
+and output usage for that request reaches `200,000` tokens by default, Lazarus
+injects an internal carryover instruction into the conversation.
+
+Configure the threshold with `LAZARUS_CARRYOVER_THRESHOLD`:
+
+```sh
+LAZARUS_CARRYOVER_THRESHOLD=250000 lazarus
+```
 
 That instruction tells the agent to make exactly one `run_python` call that
 stores whatever state the next iteration needs. After that tool call finishes,

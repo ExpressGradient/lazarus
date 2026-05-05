@@ -21,7 +21,35 @@ from rich.text import Text
 
 console = Console()
 BLOCK_PADDING = (1, 2, 0, 2)
-CARRYOVER_THRESHOLD_TOKENS = 100_000
+DEFAULT_CARRYOVER_THRESHOLD_TOKENS = 200_000
+
+
+def read_carryover_threshold_tokens() -> int:
+    raw_threshold = os.getenv("LAZARUS_CARRYOVER_THRESHOLD")
+
+    if raw_threshold is None:
+        return DEFAULT_CARRYOVER_THRESHOLD_TOKENS
+
+    try:
+        threshold = int(raw_threshold)
+    except ValueError:
+        print(
+            "error: LAZARUS_CARRYOVER_THRESHOLD must be a positive integer",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if threshold <= 0:
+        print(
+            "error: LAZARUS_CARRYOVER_THRESHOLD must be a positive integer",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    return threshold
+
+
+CARRYOVER_THRESHOLD_TOKENS = read_carryover_threshold_tokens()
 
 SYSTEM_PROMPT = """You are Lazarus, a Powerful Coding Agent.
 Current working directory: {cwd}
@@ -273,9 +301,7 @@ def ask_user() -> str | None:
     return user_input
 
 
-def _usage_text(
-    usage: TokenUsage | None, total_input: int, total_output: int
-) -> str:
+def _usage_text(usage: TokenUsage | None, total_input: int, total_output: int) -> str:
     if usage is None:
         return f"session: {total_input:,} in / {total_output:,} out"
     return f"{usage.input:,} in / {usage.output:,} out | session: {total_input:,} in / {total_output:,} out"
