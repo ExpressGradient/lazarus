@@ -197,7 +197,7 @@ class RunPython(CallableTool2[RunPythonParams]):
         async with self._lock:
             print_block(
                 "Run Python",
-                Syntax(params.code, "python", line_numbers=True),
+                Syntax(params.code, "python", line_numbers=True, word_wrap=True),
                 "magenta",
             )
 
