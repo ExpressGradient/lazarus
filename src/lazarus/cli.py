@@ -126,12 +126,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model name to pass to the selected provider. Defaults to kimi-k2.6.",
     )
     parser.add_argument(
-        "--no-stream",
-        action="store_false",
-        dest="stream",
-        help="Disable provider streaming.",
-    )
-    parser.add_argument(
         "--thinking-effort",
         choices=THINKING_EFFORTS,
         help="Enable provider thinking/reasoning effort when supported.",
@@ -153,7 +147,7 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
     provider_name = PROVIDER_ALIASES[args.provider]
     common_kwargs = {
         "model": args.model,
-        "stream": args.stream,
+        "stream": False,
     }
 
     match provider_name:
@@ -202,6 +196,7 @@ class RunPython(CallableTool2[RunPythonParams]):
     def __init__(self) -> None:
         super().__init__()
         self._proc: asyncio.subprocess.Process | None = None
+        self._protocol_reader: asyncio.StreamReader | None = None
         self._lock = asyncio.Lock()
 
     async def __call__(self, params: RunPythonParams) -> ToolReturnValue:
@@ -213,22 +208,36 @@ class RunPython(CallableTool2[RunPythonParams]):
             )
 
             if self._proc is None or self._proc.returncode is not None:
+                protocol_read_fd, protocol_write_fd = os.pipe()
                 self._proc = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-u",
                     "-m",
                     "lazarus.python_worker",
+                    str(protocol_write_fd),
                     stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    pass_fds=(protocol_write_fd,),
                 )
+                os.close(protocol_write_fd)
+
+                protocol_reader = asyncio.StreamReader()
+                protocol = asyncio.StreamReaderProtocol(protocol_reader)
+                loop = asyncio.get_running_loop()
+                await loop.connect_read_pipe(
+                    lambda: protocol,
+                    os.fdopen(protocol_read_fd, "rb", buffering=0),
+                )
+                self._protocol_reader = protocol_reader
 
             assert self._proc.stdin is not None
-            assert self._proc.stdout is not None
+            assert self._protocol_reader is not None
 
             self._proc.stdin.write((json.dumps({"code": params.code}) + "\n").encode())
             await self._proc.stdin.drain()
 
-            response = json.loads(await self._proc.stdout.readline())
+            response = json.loads(await self._protocol_reader.readline())
 
             output = response["stdout"] + response["stderr"]
             duration = response["duration"]

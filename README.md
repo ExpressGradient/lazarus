@@ -19,7 +19,6 @@ The project is intentionally small: the CLI loop lives in
   calls.
 - Automatically inject an internal carryover request when token usage gets
   large, then reset chat history while keeping the Python interpreter alive.
-- Stream model output by default when the selected provider supports it.
 
 ## Requirements
 
@@ -98,7 +97,6 @@ export KIMI_BASE_URL=https://api.moonshot.ai/v1
 ```text
 --provider               Provider alias to use. Defaults to kimi.
 --model                  Model name passed to the provider. Defaults to kimi-k2.6.
---no-stream              Disable provider streaming.
 --thinking-effort        Reasoning effort: off, low, medium, high, xhigh, or max.
 --anthropic-max-tokens   Default max_tokens for Anthropic. Defaults to 8192.
 --prompt                 Run one non-interactive request and exit.
