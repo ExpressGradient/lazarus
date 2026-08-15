@@ -77,7 +77,7 @@ def execute_cell(shell: InteractiveShell, code: str) -> CellResult:
         result = None
         infrastructure_error: BaseException | None = None
         try:
-            result = shell.run_cell(code, store_history=True, silent=False)
+            result = shell.run_cell(code, store_history=False, silent=False)
         except BaseException as exc:
             infrastructure_error = exc
         finally:

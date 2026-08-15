@@ -51,7 +51,14 @@ IPython interpreter and its state are unchanged. Continue the same task from
 that handoff without repeating completed discovery or work.
 """
 
-PROVIDERS = ("anthropic", "google", "kimi", "openai")
+PROVIDERS = ("anthropic", "glm", "google", "kimi", "openai")
+DEFAULT_MODELS = {
+    "anthropic": "claude-opus-5",
+    "glm": "glm-5.3",
+    "google": "gemini-3.7-flash",
+    "kimi": "kimi-k3",
+    "openai": "gpt-5.6-sol",
+}
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
@@ -60,7 +67,7 @@ NEW_LOOP_TOOL = "start_new_loop"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A coding agent with persistent IPython state.")
     parser.add_argument("--provider", choices=PROVIDERS, default="kimi")
-    parser.add_argument("--model", default="kimi-k2.6")
+    parser.add_argument("--model", help="Model ID; defaults to the provider's current model.")
     parser.add_argument("--thinking-effort", choices=THINKING_EFFORTS)
     parser.add_argument("--prompt", help="Run one request and exit.")
     return parser
@@ -68,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
     provider = args.provider
-    model = str(args.model)
+    model = str(args.model) if args.model else DEFAULT_MODELS[provider]
 
     match provider:
         case "kimi":
@@ -79,6 +86,10 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 
             chat = OpenAIResponses(model=model, stream=False)
+        case "glm":
+            from kosong.contrib.chat_provider.openai_legacy import OpenAILegacy
+
+            chat = OpenAILegacy(model=model, stream=False)
         case "anthropic":
             from kosong.contrib.chat_provider.anthropic import Anthropic
 
