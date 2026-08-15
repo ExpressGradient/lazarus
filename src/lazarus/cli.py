@@ -6,429 +6,341 @@ import sys
 from typing import cast
 
 import kosong
-from kosong.chat_provider import ChatProvider, ThinkingEffort, TokenUsage
-from kosong.message import Message
+from kosong.chat_provider import ChatProvider, ThinkingEffort
+from kosong.message import Message, ToolCall
 from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolResult, ToolReturnValue
 from kosong.tooling.simple import SimpleToolset
 from pydantic import BaseModel
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.padding import Padding
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.syntax import Syntax
-from rich.text import Text
-
-console = Console()
-BLOCK_PADDING = (1, 2, 0, 2)
-DEFAULT_CARRYOVER_THRESHOLD_TOKENS = 200_000
 
 
-def read_carryover_threshold_tokens() -> int:
-    raw_threshold = os.getenv("LAZARUS_CARRYOVER_THRESHOLD")
+SYSTEM_PROMPT = """You are Lazarus, a coding agent working in {cwd}.
 
-    if raw_threshold is None:
-        return DEFAULT_CARRYOVER_THRESHOLD_TOKENS
+You have two tools:
 
-    try:
-        threshold = int(raw_threshold)
-    except ValueError:
-        print(
-            "error: LAZARUS_CARRYOVER_THRESHOLD must be a positive integer",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+`python` runs an IPython cell in one long-lived interpreter. Names, imports,
+functions, objects, and IPython state survive every tool call and every new
+loop. Use it for all computer work: inspect and edit files, run shell commands,
+run tests, and keep useful state. Print only what you need to see.
 
-    if threshold <= 0:
-        print(
-            "error: LAZARUS_CARRYOVER_THRESHOLD must be a positive integer",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+`start_new_loop` runs one last IPython cell and then replaces the earlier chat
+history with that call and its result. You decide when a fresh context would
+help.
 
-    return threshold
+The `start_new_loop` cell is a free-form handoff to your next loop. There is no
+required structure. Use normal Python: comments, variables, functions, cached
+file slices, or anything else that will help. Preserve the main ask, what you
+did and learned, relevant changes and test results, what remains, the next
+action, and work that should not be repeated. Keep large useful values in the
+interpreter instead of printing them.
 
+After a new loop, you will see a notice followed by your retained handoff call
+and its result. The interpreter is the same. Trust and use the state you left.
+Continue from the recorded next action; do not repeat repository discovery or
+reread preserved files without a reason.
 
-CARRYOVER_THRESHOLD_TOKENS = read_carryover_threshold_tokens()
-
-SYSTEM_PROMPT = """You are Lazarus, a Powerful Coding Agent.
-Current working directory: {cwd}
-
-You can take actions with the run_python tool.
-It runs Python code in a persistent interpreter.
-Variables, imports, helper functions, and other Python state survive between calls.
-
-Use run_python to inspect and modify files.
-Use it to run shell commands through subprocess.
-Use it to execute tests, lint code, and analyze outputs.
-Treat it as your workspace action tool.
-
-Work like a careful senior engineer:
-- Inspect relevant files and existing patterns before editing.
-- Prefer the project's current style, tools, and abstractions.
-- Keep changes focused on the user's request.
-- Never overwrite or revert unrelated user changes.
-- Check your diff before finishing.
-- Run targeted tests, linters, or other verification when feasible.
-- If verification is blocked, say exactly what blocked it.
-- For long tasks, keep concise notes in Python state so you can continue
-  accurately after carryover.
-
-When context gets long, Lazarus may inject an internal carryover request for
-one run_python cell, then reset chat history to the original user request plus
-that cell and its result. If you see that compact history, continue from the
-carried-over Python state as the next iteration of the same task.
-
-Be proactive when the user asks for a change.
-Implement it when you can.
-Explain what you did and what you learned.
-Keep responses concise and use Markdown when helpful."""
-
-CARRYOVER_INSTRUCTION = """Context threshold reached.
-
-You must now make exactly one run_python tool call and no prose.
-Write one Python cell that preserves everything needed for the next iteration to continue the original user request after chat history is reset.
-
-The cell can contain comments, strings, lists, dicts, imports, helper functions, variables, and any compact notes you want to leave for yourself.
-Prefer storing a concise handoff in well-named variables or functions.
-Do not perform unrelated workspace changes.
+Work carefully and autonomously. Inspect before editing, preserve unrelated
+user changes, keep changes focused, check the diff, and run relevant tests.
+Finish with a concise account of the result and any verification limits.
 """
 
-PROVIDER_ALIASES = {
-    "anthropic": "anthropic",
-    "gemini": "google-genai",
-    "google": "google-genai",
-    "google-genai": "google-genai",
-    "kimi": "kimi",
-    "moonshot": "kimi",
-    "openai": "openai-responses",
-    "openai-legacy": "openai-legacy",
-    "openai-responses": "openai-responses",
-}
+NEW_LOOP_NOTICE = """A new Lazarus loop has started.
 
+Earlier chat history was intentionally replaced. The assistant tool call and
+tool result immediately below are your handoff from the previous loop. The
+IPython interpreter and its state are unchanged. Continue the same task from
+that handoff without repeating completed discovery or work.
+"""
+
+PROVIDERS = ("anthropic", "google", "kimi", "openai")
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
+PYTHON_TOOL = "python"
+NEW_LOOP_TOOL = "start_new_loop"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="lazarus",
-        description="Run the Lazarus coding agent CLI.",
-    )
-    parser.add_argument(
-        "--provider",
-        choices=sorted(PROVIDER_ALIASES),
-        default="kimi",
-        help="Chat provider to use. Defaults to kimi.",
-    )
-    parser.add_argument(
-        "--model",
-        default="kimi-k2.6",
-        help="Model name to pass to the selected provider. Defaults to kimi-k2.6.",
-    )
-    parser.add_argument(
-        "--thinking-effort",
-        choices=THINKING_EFFORTS,
-        help="Enable provider thinking/reasoning effort when supported.",
-    )
-    parser.add_argument(
-        "--anthropic-max-tokens",
-        type=int,
-        default=8192,
-        help="Default max_tokens for the Anthropic provider. Defaults to 8192.",
-    )
-    parser.add_argument(
-        "--prompt",
-        help="Run a single non-interactive job with the given prompt and exit.",
-    )
+    parser = argparse.ArgumentParser(description="A coding agent with persistent IPython state.")
+    parser.add_argument("--provider", choices=PROVIDERS, default="kimi")
+    parser.add_argument("--model", default="kimi-k2.6")
+    parser.add_argument("--thinking-effort", choices=THINKING_EFFORTS)
+    parser.add_argument("--prompt", help="Run one request and exit.")
     return parser
 
 
 def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
-    provider_name = PROVIDER_ALIASES[args.provider]
-    common_kwargs = {
-        "model": args.model,
-        "stream": False,
-    }
+    provider = args.provider
+    model = str(args.model)
 
-    match provider_name:
+    match provider:
         case "kimi":
             from kosong.chat_provider.kimi import Kimi
 
-            chat_provider: ChatProvider = Kimi(**common_kwargs)
-        case "openai-responses":
+            chat: ChatProvider = Kimi(model=model, stream=False)
+        case "openai":
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 
-            chat_provider = OpenAIResponses(**common_kwargs)
-        case "openai-legacy":
-            from kosong.contrib.chat_provider.openai_legacy import OpenAILegacy
-
-            chat_provider = OpenAILegacy(**common_kwargs)
+            chat = OpenAIResponses(model=model, stream=False)
         case "anthropic":
             from kosong.contrib.chat_provider.anthropic import Anthropic
 
-            chat_provider = Anthropic(
-                **common_kwargs,
-                default_max_tokens=args.anthropic_max_tokens,
-            )
-        case "google-genai":
+            chat = Anthropic(model=model, stream=False, default_max_tokens=8192)
+        case "google":
             from kosong.contrib.chat_provider.google_genai import GoogleGenAI
 
-            chat_provider = GoogleGenAI(**common_kwargs)
+            chat = GoogleGenAI(model=model, stream=False)
         case _:
             raise ValueError(f"Unsupported provider: {args.provider}")
 
     if args.thinking_effort:
-        return chat_provider.with_thinking(cast(ThinkingEffort, args.thinking_effort))
-    return chat_provider
+        return chat.with_thinking(cast(ThinkingEffort, args.thinking_effort))
+    return chat
 
 
-class RunPythonParams(BaseModel):
+class CellParams(BaseModel):
     code: str
 
 
-class RunPython(CallableTool2[RunPythonParams]):
-    name = "run_python"
-    description = (
-        "Run Python code in a persistent interpreter. State persists across calls."
-    )
-    params = RunPythonParams
-
+class PythonRuntime:
     def __init__(self) -> None:
-        super().__init__()
-        self._proc: asyncio.subprocess.Process | None = None
-        self._protocol_reader: asyncio.StreamReader | None = None
+        self._process: asyncio.subprocess.Process | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._reader_transport: asyncio.ReadTransport | None = None
         self._lock = asyncio.Lock()
+        self.cwd = os.getcwd()
 
-    async def __call__(self, params: RunPythonParams) -> ToolReturnValue:
+    async def run(self, code: str) -> ToolReturnValue:
         async with self._lock:
-            print_block(
-                "Run Python",
-                Syntax(params.code, "python", line_numbers=True, word_wrap=True),
-                "magenta",
+            try:
+                await self._ensure_worker()
+                assert self._process is not None
+                assert self._process.stdin is not None
+                assert self._reader is not None
+
+                request = json.dumps({"code": code}, ensure_ascii=False) + "\n"
+                self._process.stdin.write(request.encode())
+                await self._process.stdin.drain()
+                raw_response = await self._reader.readline()
+                if not raw_response:
+                    await self._forget_worker()
+                    return ToolError(
+                        message="The IPython worker exited; its in-memory state was lost.",
+                        output="",
+                        brief="Worker exited",
+                    )
+                response = json.loads(raw_response)
+            except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError) as exc:
+                await self._forget_worker()
+                return ToolError(
+                    message=f"The IPython worker protocol failed: {exc}",
+                    output="",
+                    brief="Worker failed",
+                )
+
+            if isinstance(response.get("cwd"), str):
+                self.cwd = response["cwd"]
+            output = _cell_output(response)
+            if response.get("ok"):
+                return ToolOk(output=output or "(no output)")
+            return ToolError(
+                message=str(response.get("error", "IPython cell failed")),
+                output=output,
+                brief="Cell failed",
             )
 
-            if self._proc is None or self._proc.returncode is not None:
-                protocol_read_fd, protocol_write_fd = os.pipe()
-                self._proc = await asyncio.create_subprocess_exec(
-                    sys.executable,
-                    "-u",
-                    "-m",
-                    "lazarus.python_worker",
-                    str(protocol_write_fd),
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    pass_fds=(protocol_write_fd,),
-                )
-                os.close(protocol_write_fd)
+    async def _ensure_worker(self) -> None:
+        if self._process is not None and self._process.returncode is None:
+            return
 
-                protocol_reader = asyncio.StreamReader()
-                protocol = asyncio.StreamReaderProtocol(protocol_reader)
-                loop = asyncio.get_running_loop()
-                await loop.connect_read_pipe(
-                    lambda: protocol,
-                    os.fdopen(protocol_read_fd, "rb", buffering=0),
-                )
-                self._protocol_reader = protocol_reader
+        await self._forget_worker()
+        read_fd, write_fd = os.pipe()
+        self._process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-u",
+            "-m",
+            "lazarus.python_worker",
+            str(write_fd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            pass_fds=(write_fd,),
+        )
+        os.close(write_fd)
 
-            assert self._proc.stdin is not None
-            assert self._protocol_reader is not None
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.connect_read_pipe(
+            lambda: protocol,
+            os.fdopen(read_fd, "rb", buffering=0),
+        )
+        self._reader = reader
+        self._reader_transport = transport
 
-            self._proc.stdin.write((json.dumps({"code": params.code}) + "\n").encode())
-            await self._proc.stdin.drain()
+    async def _forget_worker(self) -> None:
+        if self._reader_transport is not None:
+            self._reader_transport.close()
+        self._reader = None
+        self._reader_transport = None
 
-            response = json.loads(await self._protocol_reader.readline())
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.returncode is None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=0.5)
+            except TimeoutError:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=0.5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
 
-            output = response["stdout"] + response["stderr"]
-            duration = response["duration"]
-            brief = f"Python code executed in {duration:.3f}s"
-
-            if response["ok"]:
-                result = ToolOk(output=output, brief=brief)
-            else:
-                result = ToolError(
-                    message=response["error"],
-                    output=output,
-                    brief=brief,
-                )
-
-            print_tool_result(ToolResult(tool_call_id="", return_value=result))
-            return result
+    async def close(self) -> None:
+        async with self._lock:
+            await self._forget_worker()
 
 
-def tool_result_to_message(result: ToolResult) -> Message:
+class CellTool(CallableTool2[CellParams]):
+    params = CellParams
+
+    def __init__(self, runtime: PythonRuntime, name: str, description: str) -> None:
+        super().__init__(name=name, description=description)
+        self.runtime = runtime
+
+    async def __call__(self, params: CellParams) -> ToolReturnValue:
+        _print_cell(self.name, params.code)
+        result = await self.runtime.run(params.code)
+        _print_result(result)
+        return result
+
+
+def _cell_output(response: dict[str, object]) -> str:
+    parts = []
+    if stdout := response.get("stdout"):
+        parts.append(str(stdout).rstrip())
+    if stderr := response.get("stderr"):
+        parts.append(f"[stderr]\n{str(stderr).rstrip()}")
+    return "\n".join(parts)
+
+
+def _tool_message(result: ToolResult) -> Message:
     return Message(
         role="tool",
         tool_call_id=result.tool_call_id,
-        content=tool_result_text(result),
+        content=_result_text(result.return_value),
     )
 
 
-def print_block(
-    title: str, renderable, border_style: str, subtitle: str | None = None
-) -> None:
-    console.print(
-        Padding(
-            Panel(
-                renderable,
-                title=title,
-                border_style=border_style,
-                subtitle=Text(subtitle, style="dim") if subtitle else None,
-            ),
-            BLOCK_PADDING,
-        )
-    )
+def _new_loop_history(
+    tool_calls: list[ToolCall], results: list[ToolResult]
+) -> list[Message] | None:
+    for call, result in reversed(list(zip(tool_calls, results, strict=True))):
+        if call.function.name == NEW_LOOP_TOOL and not result.return_value.is_error:
+            return [
+                Message(role="user", content=NEW_LOOP_NOTICE),
+                Message(role="assistant", content=[], tool_calls=[call]),
+                _tool_message(result),
+            ]
+    return None
 
 
-def print_tool_result(result: ToolResult) -> None:
-    value = result.return_value
-    title = "Tool Error" if value.is_error else "Tool Output"
-    border_style = "red" if value.is_error else "green"
-    parts = []
-
-    if value.output:
-        parts.append(str(value.output))
-    if value.is_error and value.message:
-        parts.append(value.message)
-
-    print_block(
-        title,
-        "\n".join(parts).rstrip() or "(no output)",
-        border_style,
-        subtitle=value.brief or None,
-    )
+def _print_cell(name: str, code: str) -> None:
+    print(f"\n[{name}]\n{code}")
 
 
-def tool_result_text(result: ToolResult) -> str:
-    value = result.return_value
-    parts = []
+def _print_result(value: ToolReturnValue) -> None:
+    label = "error" if value.is_error else "output"
+    print(f"\n[{label}]\n{_result_text(value)}")
 
-    if value.output:
-        parts.append(str(value.output))
+
+def _result_text(value: ToolReturnValue) -> str:
+    parts = [str(value.output)] if value.output else []
     if value.message:
         parts.append(value.message)
-    if value.brief:
-        parts.append(value.brief)
-
     return "\n".join(parts).rstrip() or "(no output)"
 
 
-def ask_user() -> str | None:
-    console.print()
-    user_input = Prompt.ask("[bold cyan]>[/bold cyan]")
-    if user_input.strip() == "/quit":
-        return None
-    return user_input
-
-
-def _usage_text(usage: TokenUsage | None, total_input: int, total_output: int) -> str:
-    if usage is None:
-        return f"session: {total_input:,} in / {total_output:,} out"
-    return f"{usage.input:,} in / {usage.output:,} out | session: {total_input:,} in / {total_output:,} out"
-
-
-async def _run_request(
-    chat_provider: ChatProvider,
+async def run_request(
+    chat: ChatProvider,
     toolset: SimpleToolset,
+    runtime: PythonRuntime,
     history: list[Message],
     user_input: str,
 ) -> list[Message]:
-    original_user_message = Message(role="user", content=user_input)
-    history.append(original_user_message)
-    carryover_requested = False
-    total_input = 0
-    total_output = 0
+    history.append(Message(role="user", content=user_input))
 
     while True:
-        with console.status("[dim]Thinking...[/dim]", spinner="dots"):
-            step_result = await kosong.step(
-                chat_provider=chat_provider,
-                toolset=toolset,
-                history=history,
-                system_prompt=SYSTEM_PROMPT.format(cwd=os.getcwd()),
-            )
-        history.append(step_result.message)
+        step = await kosong.step(
+            chat_provider=chat,
+            toolset=toolset,
+            history=history,
+            system_prompt=SYSTEM_PROMPT.format(cwd=runtime.cwd),
+        )
+        history.append(step.message)
+        results = await step.tool_results()
+        result_messages = [_tool_message(result) for result in results]
+        history.extend(result_messages)
 
-        if step_result.usage:
-            total_input += step_result.usage.input
-            total_output += step_result.usage.output
-
-        tool_results = await step_result.tool_results()
-        history.extend(tool_result_to_message(result) for result in tool_results)
-
-        if carryover_requested:
-            history = [
-                original_user_message,
-                step_result.message,
-                *(tool_result_to_message(result) for result in tool_results),
-            ]
-            carryover_requested = False
-            total_input = 0
-            total_output = 0
-            console.print(
-                "[dim]Carryover cell saved; chat history reset for the next iteration.[/dim]"
-            )
+        if new_history := _new_loop_history(step.tool_calls, results):
+            history = new_history
+            print("\n[new loop]\nPrevious chat history was replaced.")
             continue
 
-        if total_input + total_output >= CARRYOVER_THRESHOLD_TOKENS:
-            history.append(Message(role="user", content=CARRYOVER_INSTRUCTION))
-            carryover_requested = True
-            console.print(
-                f"[dim]Context threshold reached "
-                f"({total_input + total_output:,}/"
-                f"{CARRYOVER_THRESHOLD_TOKENS:,} tokens); requesting carryover cell.[/dim]"
-            )
-            continue
-
-        if len(tool_results) == 0:
-            subtitle = _usage_text(step_result.usage, total_input, total_output)
-            print_block(
-                "Assistant",
-                Markdown(step_result.message.extract_text()),
-                "blue",
-                subtitle=subtitle,
-            )
+        if not results:
+            print(f"\n[assistant]\n{step.message.extract_text()}")
             return history
 
-        console.print(
-            f"[dim]{_usage_text(step_result.usage, total_input, total_output)}[/dim]"
-        )
 
-
-async def _main(chat_provider: ChatProvider, prompt: str | None = None) -> None:
+async def run(chat: ChatProvider, prompt: str | None) -> None:
+    runtime = PythonRuntime()
+    toolset = SimpleToolset(
+        [
+            CellTool(
+                runtime,
+                PYTHON_TOOL,
+                "Run a persistent IPython cell. State survives calls and new loops.",
+            ),
+            CellTool(
+                runtime,
+                NEW_LOOP_TOOL,
+                "Run a free-form handoff cell, replace chat history, and continue.",
+            ),
+        ]
+    )
     history: list[Message] = []
 
-    toolset = SimpleToolset()
-    toolset += RunPython()
+    print(f"Lazarus · {chat.name} · {chat.model_name}")
+    try:
+        if prompt is not None:
+            await run_request(chat, toolset, runtime, history, prompt)
+            return
 
-    console.print(
-        f"[dim]Using {chat_provider.name} provider with model "
-        f"{chat_provider.model_name}.[/dim]"
-    )
-
-    if prompt is not None:
-        await _run_request(chat_provider, toolset, history, prompt)
-        return
-
-    while True:
-        user_input = ask_user()
-        if user_input is None:
-            console.print("[dim]Bye[/dim]")
-            break
-
-        history = await _run_request(chat_provider, toolset, history, user_input)
+        while True:
+            try:
+                user_input = input("\n> ")
+            except EOFError:
+                break
+            if user_input.strip() == "/quit":
+                break
+            history = await run_request(chat, toolset, runtime, history, user_input)
+    finally:
+        await runtime.close()
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
     try:
-        chat_provider = create_chat_provider(args)
-    except Exception as exc:
-        parser.error(str(exc))
-
-    try:
-        asyncio.run(_main(chat_provider, prompt=args.prompt))
+        chat = create_chat_provider(args)
+        asyncio.run(run(chat, args.prompt))
     except KeyboardInterrupt:
-        console.print("\n[dim]Bye[/dim]")
+        print("\nStopped.")
+    except Exception as exc:
+        parser.exit(1, f"error: {exc}\n")
+
+
+if __name__ == "__main__":
+    main()

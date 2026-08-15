@@ -12,3 +12,6 @@ wheels/
 env.sh
 
 .DS_Store
+
+# Local tests
+/tests/

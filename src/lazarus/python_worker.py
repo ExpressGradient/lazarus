@@ -1,117 +1,148 @@
-import builtins
-import contextlib
 import json
 import os
 import sys
 import tempfile
-import time
-import traceback
-from collections.abc import Iterator
-from typing import BinaryIO
+from typing import BinaryIO, NotRequired, TypedDict
 
-PROTECTED_BUILTIN_NAMES = (
-    "print",
-    "open",
-    "input",
-    "exec",
-    "eval",
-    "compile",
-    "__import__",
-    "breakpoint",
-)
-ORIGINAL_BUILTINS = {name: getattr(builtins, name) for name in PROTECTED_BUILTIN_NAMES}
+from IPython.core.interactiveshell import InteractiveShell
+from traitlets.config import Config
 
 
-def restore_builtins(namespace: dict[str, object]) -> None:
-    namespace["__builtins__"] = builtins
-    for name, value in ORIGINAL_BUILTINS.items():
-        setattr(builtins, name, value)
-        namespace.pop(name, None)
+os.environ.setdefault("IPYTHONDIR", os.path.join(tempfile.gettempdir(), "lazarus-ipython"))
 
 
-@contextlib.contextmanager
-def captured_fds() -> Iterator[tuple[BinaryIO, BinaryIO]]:
+MAX_STREAM_BYTES = 100_000
+
+
+class CellResult(TypedDict):
+    ok: bool
+    stdout: str
+    stderr: str
+    error: NotRequired[str]
+    cwd: NotRequired[str]
+
+
+def create_shell() -> InteractiveShell:
+    config = Config()
+    config.HistoryManager.hist_file = ":memory:"
+    config.InteractiveShell.colors = "nocolor"
+    return InteractiveShell.instance(config=config)
+
+
+def _read_stream(file: BinaryIO) -> str:
+    file.flush()
+    size = file.seek(0, os.SEEK_END)
+    file.seek(0)
+    if size <= MAX_STREAM_BYTES:
+        data = file.read()
+    else:
+        head_size = MAX_STREAM_BYTES * 3 // 4
+        tail_size = MAX_STREAM_BYTES - head_size
+        head = file.read(head_size)
+        file.seek(-tail_size, os.SEEK_END)
+        tail = file.read(tail_size)
+        omitted = size - MAX_STREAM_BYTES
+        marker = f"\n... {omitted:,} output bytes omitted ...\n".encode()
+        data = head + marker + tail
+    return data.decode(errors="replace")
+
+
+def _flush(stream: object) -> None:
+    flush = getattr(stream, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        flush()
+    except Exception:
+        pass
+
+
+def execute_cell(shell: InteractiveShell, code: str) -> CellResult:
+    base_stdout = sys.__stdout__
+    base_stderr = sys.__stderr__
+
     with (
         tempfile.TemporaryFile(mode="w+b") as stdout_file,
         tempfile.TemporaryFile(mode="w+b") as stderr_file,
     ):
-        saved_stdout = os.dup(sys.stdout.fileno())
-        saved_stderr = os.dup(sys.stderr.fileno())
+        saved_stdout_fd = os.dup(1)
+        saved_stderr_fd = os.dup(2)
+        _flush(sys.stdout)
+        _flush(sys.stderr)
+        os.dup2(stdout_file.fileno(), 1)
+        os.dup2(stderr_file.fileno(), 2)
+        sys.stdout = base_stdout
+        sys.stderr = base_stderr
 
+        result = None
+        infrastructure_error: BaseException | None = None
         try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os.dup2(stdout_file.fileno(), sys.stdout.fileno())
-            os.dup2(stderr_file.fileno(), sys.stderr.fileno())
-            yield stdout_file, stderr_file
+            result = shell.run_cell(code, store_history=True, silent=False)
+        except BaseException as exc:
+            infrastructure_error = exc
         finally:
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os.dup2(saved_stdout, sys.stdout.fileno())
-            os.dup2(saved_stderr, sys.stderr.fileno())
-            os.close(saved_stdout)
-            os.close(saved_stderr)
+            _flush(sys.stdout)
+            _flush(sys.stderr)
+            _flush(base_stdout)
+            _flush(base_stderr)
+            os.dup2(saved_stdout_fd, 1)
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stdout_fd)
+            os.close(saved_stderr_fd)
+            sys.stdout = base_stdout
+            sys.stderr = base_stderr
 
+        stdout = _read_stream(stdout_file)
+        stderr = _read_stream(stderr_file)
 
-def read_file(file: BinaryIO) -> str:
-    file.flush()
-    file.seek(0)
-    return file.read().decode(errors="replace")
+    error = infrastructure_error
+    if error is None and result is not None:
+        error = result.error_before_exec or result.error_in_exec
 
-
-def execute(code: str, namespace: dict[str, object]) -> dict[str, object]:
-    start = time.perf_counter()
-    stdout = ""
-    stderr = ""
-
+    response: CellResult = {
+        "ok": error is None,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+    if error is not None:
+        response["error"] = f"{type(error).__name__}: {error}"
     try:
-        restore_builtins(namespace)
-        with captured_fds() as (stdout_file, stderr_file):
-            try:
-                exec(code, namespace, namespace)
-            finally:
-                stdout = read_file(stdout_file)
-                stderr = read_file(stderr_file)
-        restore_builtins(namespace)
-        return {
-            "ok": True,
-            "stdout": stdout,
-            "stderr": stderr,
-            "duration": time.perf_counter() - start,
-        }
-    except Exception:
-        restore_builtins(namespace)
-        return {
-            "ok": False,
-            "stdout": stdout,
-            "stderr": stderr,
-            "error": traceback.format_exc(),
-            "duration": time.perf_counter() - start,
-        }
+        response["cwd"] = os.getcwd()
+    except OSError:
+        pass
+    return response
+
+
+def _protocol_input() -> BinaryIO:
+    request_fd = os.dup(0)
+    devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull_fd, 0)
+    os.close(devnull_fd)
+    sys.stdin = open(0, encoding="utf-8", closefd=False)
+    return os.fdopen(request_fd, "rb", buffering=0)
 
 
 def main() -> None:
-    namespace: dict[str, object] = {"__name__": "__main__"}
-    protocol = (
-        os.fdopen(int(sys.argv[1]), "w", buffering=1)
-        if len(sys.argv) > 1
-        else sys.stdout
-    )
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: python_worker RESPONSE_FD")
 
-    for line in sys.stdin:
+    requests = _protocol_input()
+    responses = os.fdopen(int(sys.argv[1]), "w", encoding="utf-8", buffering=1)
+    shell = create_shell()
+
+    for raw_line in requests:
         try:
-            request = json.loads(line)
-            response = execute(request["code"], namespace)
-        except Exception:
+            request = json.loads(raw_line)
+            response = execute_cell(shell, request["code"])
+        except BaseException as exc:
             response = {
                 "ok": False,
                 "stdout": "",
                 "stderr": "",
-                "error": traceback.format_exc(),
-                "duration": 0,
+                "error": f"{type(exc).__name__}: {exc}",
             }
-
-        print(json.dumps(response), file=protocol, flush=True)
+        responses.write(json.dumps(response, ensure_ascii=False) + "\n")
+        responses.flush()
 
 
 if __name__ == "__main__":
