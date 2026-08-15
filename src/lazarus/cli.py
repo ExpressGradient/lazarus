@@ -51,13 +51,12 @@ IPython interpreter and its state are unchanged. Continue the same task from
 that handoff without repeating completed discovery or work.
 """
 
-PROVIDERS = ("anthropic", "google", "kimi", "openai", "zai")
+PROVIDERS = ("anthropic", "google", "kimi", "openai", "openai-legacy")
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
     "google": "gemini-3.7-flash",
     "kimi": "kimi-k3",
     "openai": "gpt-5.6-sol",
-    "zai": "glm-5.2",
 }
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
@@ -67,7 +66,10 @@ NEW_LOOP_TOOL = "start_new_loop"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A coding agent with persistent IPython state.")
     parser.add_argument("--provider", choices=PROVIDERS, default="kimi")
-    parser.add_argument("--model", help="Model ID; defaults to the provider's current model.")
+    parser.add_argument(
+        "--model",
+        help="Model ID; required for openai-legacy, otherwise uses the provider default.",
+    )
     parser.add_argument("--thinking-effort", choices=THINKING_EFFORTS)
     parser.add_argument("--prompt", help="Run one request and exit.")
     return parser
@@ -75,7 +77,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
     provider = args.provider
-    model = str(args.model) if args.model else DEFAULT_MODELS[provider]
+    if args.model:
+        model = str(args.model)
+    elif provider == "openai-legacy":
+        raise ValueError("--model is required for the openai-legacy provider")
+    else:
+        model = DEFAULT_MODELS[provider]
 
     match provider:
         case "kimi":
@@ -86,18 +93,18 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 
             chat = OpenAIResponses(model=model, stream=False)
-        case "zai":
+        case "openai-legacy":
             from kosong.contrib.chat_provider.openai_legacy import OpenAILegacy
 
-            api_key = os.getenv("ZAI_API_KEY")
+            api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("ZAI_API_KEY is required for the Z.AI provider")
+                raise ValueError("OPENAI_API_KEY is required for the openai-legacy provider")
             chat = OpenAILegacy(
                 model=model,
                 api_key=api_key,
-                base_url=os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4/"),
+                base_url=os.getenv("OPENAI_BASE_URL"),
                 stream=False,
-                reasoning_key="reasoning_content",
+                reasoning_key=os.getenv("OPENAI_REASONING_KEY"),
             )
         case "anthropic":
             from kosong.contrib.chat_provider.anthropic import Anthropic
