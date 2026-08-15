@@ -57,7 +57,7 @@ DEFAULT_MODELS = {
     "google": "gemini-3.7-flash",
     "kimi": "kimi-k3",
     "openai": "gpt-5.6-sol",
-    "zai": "glm-5.3",
+    "zai": "glm-5.2",
 }
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"

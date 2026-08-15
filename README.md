@@ -48,15 +48,12 @@ lazarus --provider kimi       # kimi-k3
 lazarus --provider openai     # gpt-5.6-sol
 lazarus --provider anthropic  # claude-opus-5
 lazarus --provider google     # gemini-3.7-flash
-lazarus --provider zai        # glm-5.3
+lazarus --provider zai        # glm-5.2
 ```
 
 Set the credentials expected by the chosen provider before running Lazarus.
 For Z.AI, set `ZAI_API_KEY`. `ZAI_BASE_URL` can override its default general API
 endpoint, `https://api.z.ai/api/paas/v4/`.
-
-Z.AI currently marks the general GLM-5.3 API as coming soon. Its Coding Plan
-endpoint is restricted to tools supported by that plan.
 
 ## Execution model
 
