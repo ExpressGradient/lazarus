@@ -4,16 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lazarus"
-version = "0.1.0"
-description = "A terminal coding agent with persistent Python tools and carryover"
+version = "0.2.0"
+description = "A coding agent with persistent IPython state and model-controlled context loops"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [
     { name = "Sai Praneeth Diddigam", email = "hi@saipraneeth.in" },
 ]
 dependencies = [
+    "ipython>=9.15.0",
     "kosong[contrib]>=0.53.0",
-    "rich>=15.0.0",
 ]
 
 [project.scripts]
