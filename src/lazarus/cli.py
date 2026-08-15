@@ -51,13 +51,13 @@ IPython interpreter and its state are unchanged. Continue the same task from
 that handoff without repeating completed discovery or work.
 """
 
-PROVIDERS = ("anthropic", "glm", "google", "kimi", "openai")
+PROVIDERS = ("anthropic", "google", "kimi", "openai", "zai")
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
-    "glm": "glm-5.3",
     "google": "gemini-3.7-flash",
     "kimi": "kimi-k3",
     "openai": "gpt-5.6-sol",
+    "zai": "glm-5.3",
 }
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
@@ -86,10 +86,19 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
             from kosong.contrib.chat_provider.openai_responses import OpenAIResponses
 
             chat = OpenAIResponses(model=model, stream=False)
-        case "glm":
+        case "zai":
             from kosong.contrib.chat_provider.openai_legacy import OpenAILegacy
 
-            chat = OpenAILegacy(model=model, stream=False)
+            api_key = os.getenv("ZAI_API_KEY")
+            if not api_key:
+                raise ValueError("ZAI_API_KEY is required for the Z.AI provider")
+            chat = OpenAILegacy(
+                model=model,
+                api_key=api_key,
+                base_url=os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4/"),
+                stream=False,
+                reasoning_key="reasoning_content",
+            )
         case "anthropic":
             from kosong.contrib.chat_provider.anthropic import Anthropic
 
