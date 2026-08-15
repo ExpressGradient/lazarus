@@ -9,10 +9,11 @@ The model has two tools:
 - `start_new_loop` runs a final handoff cell, discards earlier chat history,
   and continues with the same IPython process.
 
-The model decides when to start a new loop. Its handoff cell is ordinary,
-free-form Python. It can preserve notes, functions, objects, relevant file
-slices, commands, and anything else the next loop needs. There is no checkpoint
-schema or helper API.
+The model decides when to start a new loop. Lazarus also steers it toward a
+handoff when the current context reaches 250,000 tokens. The handoff cell is
+ordinary, free-form Python. It can preserve notes, functions, objects, relevant
+file slices, commands, and anything else the next loop needs. There is no
+checkpoint schema or helper API.
 
 ## Install
 
@@ -62,7 +63,9 @@ in an extra message field can set `OPENAI_REASONING_KEY`, such as
 IPython runs in a child process. Requests and results use a private JSON channel,
 so Python and subprocess output cannot corrupt the protocol. Standard input is
 detached from that channel, output is capped before returning it to the model,
-and names remain alive until Lazarus exits or the worker process dies.
+and names remain alive until Lazarus exits or the worker process dies. Concurrent
+tool requests are serialized, and each displayed call stays paired with its
+result.
 
 When `start_new_loop` succeeds, Lazarus retains only:
 
@@ -72,6 +75,19 @@ When `start_new_loop` succeeds, Lazarus retains only:
 
 The system prompt and IPython process stay unchanged, so the next loop can use
 the cell source and the state it created without rediscovering the project.
+
+## Context and token usage
+
+After every model response, Lazarus prints a `LAZARUS_TOKEN_USAGE` JSON record
+with cumulative input, cache-read, cache-creation, output, total, and successful
+loop-reset counts. This makes long agent runs measurable without changing the
+model conversation.
+
+Automatic steering uses the size of the latest context, not cumulative billing
+usage. Cached and uncached input are counted once, along with the latest output.
+At 250,000 tokens, Lazarus adds one user message asking the model to compact its
+useful state into a handoff and call `start_new_loop`. A successful reset clears
+that loop's steering state while lifetime usage totals continue accumulating.
 
 ## Development
 

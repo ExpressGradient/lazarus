@@ -3,10 +3,11 @@ import asyncio
 import json
 import os
 import sys
+from dataclasses import dataclass
 from typing import cast
 
 import kosong
-from kosong.chat_provider import ChatProvider, ThinkingEffort
+from kosong.chat_provider import ChatProvider, ThinkingEffort, TokenUsage
 from kosong.message import Message, ToolCall
 from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolResult, ToolReturnValue
 from kosong.tooling.simple import SimpleToolset
@@ -61,10 +62,62 @@ DEFAULT_MODELS = {
 THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
+TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
+LOOP_STEER_TOKEN_THRESHOLD = 250_000
+LOOP_STEER_MESSAGE = (
+    "This loop's current context has reached at least 250k tokens. Compact the useful state "
+    "into a concise handoff and call `start_new_loop` now."
+)
+
+
+@dataclass
+class TokenTotals:
+    input_other: int = 0
+    input_cache_read: int = 0
+    input_cache_creation: int = 0
+    output: int = 0
+    loops_started: int = 0
+    loop_context_tokens: int = 0
+    loop_steer_sent: bool = False
+
+    def add(self, usage: TokenUsage | None) -> None:
+        if usage is None:
+            return
+        self.input_other += usage.input_other
+        self.input_cache_read += usage.input_cache_read
+        self.input_cache_creation += usage.input_cache_creation
+        self.output += usage.output
+        self.loop_context_tokens = (
+            usage.input_other
+            + usage.input_cache_read
+            + usage.input_cache_creation
+            + usage.output
+        )
+
+    @property
+    def input(self) -> int:
+        return self.input_other + self.input_cache_read + self.input_cache_creation
+
+    @property
+    def total(self) -> int:
+        return self.input + self.output
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "input": self.input,
+            "input_other": self.input_other,
+            "input_cache_read": self.input_cache_read,
+            "input_cache_creation": self.input_cache_creation,
+            "output": self.output,
+            "total": self.total,
+            "loops_started": self.loops_started,
+        }
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="A coding agent with persistent IPython state.")
+    parser = argparse.ArgumentParser(
+        description="A coding agent with persistent IPython state."
+    )
     parser.add_argument("--provider", choices=PROVIDERS, default="kimi")
     parser.add_argument(
         "--model",
@@ -98,7 +151,9 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
 
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                raise ValueError("OPENAI_API_KEY is required for the openai-legacy provider")
+                raise ValueError(
+                    "OPENAI_API_KEY is required for the openai-legacy provider"
+                )
             chat = OpenAILegacy(
                 model=model,
                 api_key=api_key,
@@ -134,44 +189,52 @@ class PythonRuntime:
         self._lock = asyncio.Lock()
         self.cwd = os.getcwd()
 
-    async def run(self, code: str) -> ToolReturnValue:
+    async def run(self, code: str, display_name: str | None = None) -> ToolReturnValue:
         async with self._lock:
-            try:
-                await self._ensure_worker()
-                assert self._process is not None
-                assert self._process.stdin is not None
-                assert self._reader is not None
+            if display_name is not None:
+                _print_cell(display_name, code)
+            result = await self._run_locked(code)
+            if display_name is not None:
+                _print_result(result)
+            return result
 
-                request = json.dumps({"code": code}, ensure_ascii=False) + "\n"
-                self._process.stdin.write(request.encode())
-                await self._process.stdin.drain()
-                raw_response = await self._reader.readline()
-                if not raw_response:
-                    await self._forget_worker()
-                    return ToolError(
-                        message="The IPython worker exited; its in-memory state was lost.",
-                        output="",
-                        brief="Worker exited",
-                    )
-                response = json.loads(raw_response)
-            except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError) as exc:
+    async def _run_locked(self, code: str) -> ToolReturnValue:
+        try:
+            await self._ensure_worker()
+            assert self._process is not None
+            assert self._process.stdin is not None
+            assert self._reader is not None
+
+            request = json.dumps({"code": code}, ensure_ascii=False) + "\n"
+            self._process.stdin.write(request.encode())
+            await self._process.stdin.drain()
+            raw_response = await self._reader.readline()
+            if not raw_response:
                 await self._forget_worker()
                 return ToolError(
-                    message=f"The IPython worker protocol failed: {exc}",
+                    message="The IPython worker exited; its in-memory state was lost.",
                     output="",
-                    brief="Worker failed",
+                    brief="Worker exited",
                 )
-
-            if isinstance(response.get("cwd"), str):
-                self.cwd = response["cwd"]
-            output = _cell_output(response)
-            if response.get("ok"):
-                return ToolOk(output=output or "(no output)")
+            response = json.loads(raw_response)
+        except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError) as exc:
+            await self._forget_worker()
             return ToolError(
-                message=str(response.get("error", "IPython cell failed")),
-                output=output,
-                brief="Cell failed",
+                message=f"The IPython worker protocol failed: {exc}",
+                output="",
+                brief="Worker failed",
             )
+
+        if isinstance(response.get("cwd"), str):
+            self.cwd = response["cwd"]
+        output = _cell_output(response)
+        if response.get("ok"):
+            return ToolOk(output=output or "(no output)")
+        return ToolError(
+            message=str(response.get("error", "IPython cell failed")),
+            output=output,
+            brief="Cell failed",
+        )
 
     async def _ensure_worker(self) -> None:
         if self._process is not None and self._process.returncode is None:
@@ -238,10 +301,7 @@ class CellTool(CallableTool2[CellParams]):
         self.runtime = runtime
 
     async def __call__(self, params: CellParams) -> ToolReturnValue:
-        _print_cell(self.name, params.code)
-        result = await self.runtime.run(params.code)
-        _print_result(result)
-        return result
+        return await self.runtime.run(params.code, display_name=self.name)
 
 
 def _cell_output(response: dict[str, object]) -> str:
@@ -290,12 +350,23 @@ def _result_text(value: ToolReturnValue) -> str:
     return "\n".join(parts).rstrip() or "(no output)"
 
 
+def _print_token_usage(totals: TokenTotals) -> None:
+    print(f"{TOKEN_USAGE_PREFIX}{json.dumps(totals.as_dict(), separators=(',', ':'))}")
+
+
+def _system_prompt(cwd: str, totals: TokenTotals) -> str:
+    return SYSTEM_PROMPT.format(cwd=cwd) + (
+        f"\nSuccessful loop resets so far: {totals.loops_started}."
+    )
+
+
 async def run_request(
     chat: ChatProvider,
     toolset: SimpleToolset,
     runtime: PythonRuntime,
     history: list[Message],
     user_input: str,
+    token_totals: TokenTotals,
 ) -> list[Message]:
     history.append(Message(role="user", content=user_input))
 
@@ -304,17 +375,31 @@ async def run_request(
             chat_provider=chat,
             toolset=toolset,
             history=history,
-            system_prompt=SYSTEM_PROMPT.format(cwd=runtime.cwd),
+            system_prompt=_system_prompt(runtime.cwd, token_totals),
         )
+        token_totals.add(step.usage)
+        _print_token_usage(token_totals)
         history.append(step.message)
         results = await step.tool_results()
         result_messages = [_tool_message(result) for result in results]
         history.extend(result_messages)
 
         if new_history := _new_loop_history(step.tool_calls, results):
+            token_totals.loops_started += 1
+            token_totals.loop_context_tokens = 0
+            token_totals.loop_steer_sent = False
             history = new_history
             print("\n[new loop]\nPrevious chat history was replaced.")
             continue
+
+        if (
+            results
+            and not token_totals.loop_steer_sent
+            and token_totals.loop_context_tokens >= LOOP_STEER_TOKEN_THRESHOLD
+        ):
+            history.append(Message(role="user", content=LOOP_STEER_MESSAGE))
+            token_totals.loop_steer_sent = True
+            print(f"\n[steer]\n{LOOP_STEER_MESSAGE}")
 
         if not results:
             print(f"\n[assistant]\n{step.message.extract_text()}")
@@ -338,11 +423,12 @@ async def run(chat: ChatProvider, prompt: str | None) -> None:
         ]
     )
     history: list[Message] = []
+    token_totals = TokenTotals()
 
     print(f"Lazarus · {chat.name} · {chat.model_name}")
     try:
         if prompt is not None:
-            await run_request(chat, toolset, runtime, history, prompt)
+            await run_request(chat, toolset, runtime, history, prompt, token_totals)
             return
 
         while True:
@@ -352,7 +438,9 @@ async def run(chat: ChatProvider, prompt: str | None) -> None:
                 break
             if user_input.strip() == "/quit":
                 break
-            history = await run_request(chat, toolset, runtime, history, user_input)
+            history = await run_request(
+                chat, toolset, runtime, history, user_input, token_totals
+            )
     finally:
         await runtime.close()
 
