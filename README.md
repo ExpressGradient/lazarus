@@ -39,17 +39,21 @@ Quit an interactive session with `/quit`.
 
 ## Providers
 
-Lazarus uses `kosong` and supports Kimi/Moonshot, OpenAI, Anthropic, and Google.
-It defaults to Kimi with `kimi-k2.6`.
+Lazarus uses `kosong` and supports Kimi, OpenAI, Anthropic, Google, and Z.AI.
+Each provider has a default model, while `--model` accepts any model ID
+supported by that provider.
 
 ```sh
-lazarus --provider kimi --model kimi-k2.6
-lazarus --provider openai --model gpt-5.2
-lazarus --provider anthropic --model claude-sonnet-4.6
-lazarus --provider google --model gemini-3-pro
+lazarus --provider kimi       # kimi-k3
+lazarus --provider openai     # gpt-5.6-sol
+lazarus --provider anthropic  # claude-opus-5
+lazarus --provider google     # gemini-3.7-flash
+lazarus --provider zai        # glm-5.2
 ```
 
 Set the credentials expected by the chosen provider before running Lazarus.
+For Z.AI, set `ZAI_API_KEY`. `ZAI_BASE_URL` can override its default general API
+endpoint, `https://api.z.ai/api/paas/v4/`.
 
 ## Execution model
 
