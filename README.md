@@ -69,19 +69,21 @@ result.
 
 When `start_new_loop` succeeds, Lazarus retains only:
 
-1. A notice explaining that a new loop began.
+1. The original user task.
 2. The assistant's handoff tool call.
 3. The handoff tool result.
 
-The system prompt and IPython process stay unchanged, so the next loop can use
-the cell source and the state it created without rediscovering the project.
+The system prompt and IPython process stay unchanged. The retained tool call
+makes the reset explicit, while restoring the original task prevents the goal
+from depending on the model's handoff. Lazarus adds no separate reset message.
 
 ## Context and token usage
 
 After every model response, Lazarus prints a `LAZARUS_TOKEN_USAGE` JSON record
 with cumulative input, cache-read, cache-creation, output, total, and successful
 loop-reset counts. This makes long agent runs measurable without changing the
-model conversation.
+model conversation. Reset counts remain telemetry and are not added to the
+system prompt.
 
 Automatic steering uses the size of the latest context, not cumulative billing
 usage. Cached and uncached input are counted once, along with the latest output.
