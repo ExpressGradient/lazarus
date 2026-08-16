@@ -34,22 +34,9 @@ did and learned, relevant changes and test results, what remains, the next
 action, and work that should not be repeated. Keep large useful values in the
 interpreter instead of printing them.
 
-After a new loop, you will see a notice followed by your retained handoff call
-and its result. The interpreter is the same. Trust and use the state you left.
-Continue from the recorded next action; do not repeat repository discovery or
-reread preserved files without a reason.
-
 Work carefully and autonomously. Inspect before editing, preserve unrelated
 user changes, keep changes focused, check the diff, and run relevant tests.
 Finish with a concise account of the result and any verification limits.
-"""
-
-NEW_LOOP_NOTICE = """A new Lazarus loop has started.
-
-Earlier chat history was intentionally replaced. The assistant tool call and
-tool result immediately below are your handoff from the previous loop. The
-IPython interpreter and its state are unchanged. Continue the same task from
-that handoff without repeating completed discovery or work.
 """
 
 PROVIDERS = ("anthropic", "google", "kimi", "openai", "openai-legacy")
@@ -322,12 +309,12 @@ def _tool_message(result: ToolResult) -> Message:
 
 
 def _new_loop_history(
-    tool_calls: list[ToolCall], results: list[ToolResult]
+    task: str, tool_calls: list[ToolCall], results: list[ToolResult]
 ) -> list[Message] | None:
     for call, result in reversed(list(zip(tool_calls, results, strict=True))):
         if call.function.name == NEW_LOOP_TOOL and not result.return_value.is_error:
             return [
-                Message(role="user", content=NEW_LOOP_NOTICE),
+                Message(role="user", content=task),
                 Message(role="assistant", content=[], tool_calls=[call]),
                 _tool_message(result),
             ]
@@ -354,10 +341,8 @@ def _print_token_usage(totals: TokenTotals) -> None:
     print(f"{TOKEN_USAGE_PREFIX}{json.dumps(totals.as_dict(), separators=(',', ':'))}")
 
 
-def _system_prompt(cwd: str, totals: TokenTotals) -> str:
-    return SYSTEM_PROMPT.format(cwd=cwd) + (
-        f"\nSuccessful loop resets so far: {totals.loops_started}."
-    )
+def _system_prompt(cwd: str) -> str:
+    return SYSTEM_PROMPT.format(cwd=cwd)
 
 
 async def run_request(
@@ -375,7 +360,7 @@ async def run_request(
             chat_provider=chat,
             toolset=toolset,
             history=history,
-            system_prompt=_system_prompt(runtime.cwd, token_totals),
+            system_prompt=_system_prompt(runtime.cwd),
         )
         token_totals.add(step.usage)
         _print_token_usage(token_totals)
@@ -384,7 +369,7 @@ async def run_request(
         result_messages = [_tool_message(result) for result in results]
         history.extend(result_messages)
 
-        if new_history := _new_loop_history(step.tool_calls, results):
+        if new_history := _new_loop_history(user_input, step.tool_calls, results):
             token_totals.loops_started += 1
             token_totals.loop_context_tokens = 0
             token_totals.loop_steer_sent = False
