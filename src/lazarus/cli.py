@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 from dataclasses import dataclass
 from typing import cast
@@ -260,6 +261,7 @@ class PythonRuntime:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             pass_fds=(write_fd,),
+            start_new_session=os.name == "posix",
         )
         os.close(write_fd)
 
@@ -289,12 +291,26 @@ class PythonRuntime:
             try:
                 await asyncio.wait_for(process.wait(), timeout=0.5)
             except TimeoutError:
-                process.terminate()
+                self._signal_worker(process, force=False)
                 try:
                     await asyncio.wait_for(process.wait(), timeout=0.5)
                 except TimeoutError:
-                    process.kill()
+                    self._signal_worker(process, force=True)
                     await process.wait()
+        if os.name == "posix":
+            self._signal_worker(process, force=True)
+
+    @staticmethod
+    def _signal_worker(process: asyncio.subprocess.Process, *, force: bool) -> None:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        elif force:
+            process.kill()
+        else:
+            process.terminate()
 
     async def close(self) -> None:
         async with self._lock:
