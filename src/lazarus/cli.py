@@ -21,7 +21,9 @@ You have two tools:
 `python` runs an IPython cell in one long-lived interpreter. Names, imports,
 functions, objects, and IPython state survive every tool call and every new
 loop. Use it for all computer work: inspect and edit files, run shell commands,
-run tests, and keep useful state. Print only what you need to see.
+run tests, and keep useful state. It is your persistent workspace, so consider
+building your own helpers and functions when they would make repeated work
+easier. Print only what you need to see.
 
 `start_new_loop` runs one last IPython cell and then replaces the earlier chat
 history with that call and its result. You decide when a fresh context would
