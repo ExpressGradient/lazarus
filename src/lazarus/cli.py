@@ -23,7 +23,8 @@ functions, objects, and IPython state survive every tool call and every new
 loop. Use it for all computer work: inspect and edit files, run shell commands,
 run tests, and keep useful state. It is your persistent workspace, so consider
 building your own helpers and functions when they would make repeated work
-easier. Print only what you need to see.
+easier. Calls time out after 300 seconds by default; set `timeout` when needed.
+Print only what you need to see.
 
 `start_new_loop` runs one last IPython cell and then replaces the earlier chat
 history with that call and its result. You decide when a fresh context would
@@ -53,6 +54,7 @@ PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
 DEFAULT_LOOP_TOKEN_LIMIT = 250_000
+DEFAULT_CELL_TIMEOUT = 300.0
 
 
 @dataclass
@@ -171,6 +173,7 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
 
 class CellParams(BaseModel):
     code: str
+    timeout: float = DEFAULT_CELL_TIMEOUT
 
 
 class PythonRuntime:
@@ -181,11 +184,24 @@ class PythonRuntime:
         self._lock = asyncio.Lock()
         self.cwd = os.getcwd()
 
-    async def run(self, code: str, display_name: str | None = None) -> ToolReturnValue:
+    async def run(
+        self,
+        code: str,
+        display_name: str | None = None,
+        timeout: float = DEFAULT_CELL_TIMEOUT,
+    ) -> ToolReturnValue:
         async with self._lock:
             if display_name is not None:
                 _print_cell(display_name, code)
-            result = await self._run_locked(code)
+            try:
+                result = await asyncio.wait_for(self._run_locked(code), timeout)
+            except TimeoutError:
+                await self._forget_worker()
+                result = ToolError(
+                    message=f"Cell exceeded the {timeout:g}s timeout; interpreter state was lost.",
+                    output="",
+                    brief="Cell timed out",
+                )
             if display_name is not None:
                 _print_result(result)
             return result
@@ -293,7 +309,7 @@ class CellTool(CallableTool2[CellParams]):
         self.runtime = runtime
 
     async def __call__(self, params: CellParams) -> ToolReturnValue:
-        return await self.runtime.run(params.code, display_name=self.name)
+        return await self.runtime.run(params.code, self.name, params.timeout)
 
 
 def _cell_output(response: dict[str, object]) -> str:

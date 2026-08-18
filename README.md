@@ -9,6 +9,9 @@ The model has two tools:
 - `start_new_loop` runs a final handoff cell, discards earlier chat history,
   and continues with the same IPython process.
 
+Both tools default to a 300-second timeout. The model can set `timeout` on any
+call when a cell needs more or less time.
+
 The model decides when to start a new loop. Lazarus also steers it toward a
 handoff when the current context reaches 250,000 tokens. The handoff cell is
 ordinary, free-form Python. It can preserve notes, functions, objects, relevant
