@@ -52,11 +52,7 @@ THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
-LOOP_STEER_TOKEN_THRESHOLD = 250_000
-LOOP_STEER_MESSAGE = (
-    "This loop's current context has reached at least 250k tokens. Compact the useful state "
-    "into a concise handoff and call `start_new_loop` now."
-)
+DEFAULT_LOOP_TOKEN_LIMIT = 250_000
 
 
 @dataclass
@@ -113,6 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model ID; required for openai-legacy, otherwise uses the provider default.",
     )
     parser.add_argument("--thinking-effort", choices=THINKING_EFFORTS)
+    parser.add_argument(
+        "--loop-token-limit",
+        type=int,
+        default=DEFAULT_LOOP_TOKEN_LIMIT,
+        metavar="TOKENS",
+        help="Steer the model to start a new loop at this context size (default: 250k).",
+    )
     parser.add_argument("--prompt", help="Run one request and exit.")
     return parser
 
@@ -354,6 +357,7 @@ async def run_request(
     history: list[Message],
     user_input: str,
     token_totals: TokenTotals,
+    loop_token_limit: int,
 ) -> list[Message]:
     history.append(Message(role="user", content=user_input))
 
@@ -382,18 +386,23 @@ async def run_request(
         if (
             results
             and not token_totals.loop_steer_sent
-            and token_totals.loop_context_tokens >= LOOP_STEER_TOKEN_THRESHOLD
+            and token_totals.loop_context_tokens >= loop_token_limit
         ):
-            history.append(Message(role="user", content=LOOP_STEER_MESSAGE))
+            steer_message = (
+                f"This loop's current context has reached at least {loop_token_limit} "
+                "tokens. Compact the useful state into a concise handoff and call "
+                "`start_new_loop` now."
+            )
+            history.append(Message(role="user", content=steer_message))
             token_totals.loop_steer_sent = True
-            print(f"\n[steer]\n{LOOP_STEER_MESSAGE}")
+            print(f"\n[steer]\n{steer_message}")
 
         if not results:
             print(f"\n[assistant]\n{step.message.extract_text()}")
             return history
 
 
-async def run(chat: ChatProvider, prompt: str | None) -> None:
+async def run(chat: ChatProvider, prompt: str | None, loop_token_limit: int) -> None:
     runtime = PythonRuntime()
     toolset = SimpleToolset(
         [
@@ -415,7 +424,15 @@ async def run(chat: ChatProvider, prompt: str | None) -> None:
     print(f"Lazarus · {chat.name} · {chat.model_name}")
     try:
         if prompt is not None:
-            await run_request(chat, toolset, runtime, history, prompt, token_totals)
+            await run_request(
+                chat,
+                toolset,
+                runtime,
+                history,
+                prompt,
+                token_totals,
+                loop_token_limit,
+            )
             return
 
         while True:
@@ -426,7 +443,13 @@ async def run(chat: ChatProvider, prompt: str | None) -> None:
             if user_input.strip() == "/quit":
                 break
             history = await run_request(
-                chat, toolset, runtime, history, user_input, token_totals
+                chat,
+                toolset,
+                runtime,
+                history,
+                user_input,
+                token_totals,
+                loop_token_limit,
             )
     finally:
         await runtime.close()
@@ -437,7 +460,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         chat = create_chat_provider(args)
-        asyncio.run(run(chat, args.prompt))
+        asyncio.run(run(chat, args.prompt, args.loop_token_limit))
     except KeyboardInterrupt:
         print("\nStopped.")
     except Exception as exc:

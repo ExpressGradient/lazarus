@@ -36,6 +36,12 @@ Run one request and exit:
 lazarus --prompt "fix the failing tests"
 ```
 
+Start a fresh context loop earlier, for example at 150,000 tokens:
+
+```sh
+lazarus --loop-token-limit 150000
+```
+
 Quit an interactive session with `/quit`.
 
 ## Providers
@@ -87,9 +93,10 @@ system prompt.
 
 Automatic steering uses the size of the latest context, not cumulative billing
 usage. Cached and uncached input are counted once, along with the latest output.
-At 250,000 tokens, Lazarus adds one user message asking the model to compact its
-useful state into a handoff and call `start_new_loop`. A successful reset clears
-that loop's steering state while lifetime usage totals continue accumulating.
+At 250,000 tokens by default, Lazarus adds one user message asking the model to
+compact its useful state into a handoff and call `start_new_loop`. Change the
+threshold with `--loop-token-limit`. A successful reset clears that loop's
+steering state while lifetime usage totals continue accumulating.
 
 ## Development
 
