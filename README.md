@@ -55,12 +55,14 @@ Quit an interactive session with `/quit`.
 
 ## Providers
 
-Lazarus uses `kosong` and supports Kimi, OpenAI Responses, Anthropic, Google,
-and generic OpenAI-compatible Chat Completions APIs. The named providers have
-default models; `openai-legacy` requires an explicit model ID.
+Lazarus uses `kosong` and supports Kimi, OpenAI Responses, Codex subscription
+usage, Anthropic, Google, and generic OpenAI-compatible Chat Completions APIs.
+The named providers have default models; `openai-legacy` requires an explicit
+model ID.
 
 ```sh
 lazarus --provider kimi       # kimi-k3
+lazarus --provider codex      # gpt-5.6-sol, uses `codex login`
 lazarus --provider openai     # gpt-5.6-sol
 lazarus --provider anthropic  # claude-opus-5
 lazarus --provider google     # gemini-3.7-flash
@@ -68,6 +70,7 @@ lazarus --provider openai-legacy --model your-model
 ```
 
 Set the credentials expected by the chosen provider before running Lazarus.
+For `codex`, run `codex login`; usage counts against that ChatGPT subscription.
 For `openai-legacy`, set `OPENAI_API_KEY`. Set `OPENAI_BASE_URL` for a compatible
 server; if omitted, it uses OpenAI's default endpoint. APIs that return thinking
 in an extra message field can set `OPENAI_REASONING_KEY`, such as

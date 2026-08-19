@@ -44,9 +44,10 @@ user changes, keep changes focused, check the diff, and run relevant tests.
 Finish with a concise account of the result and any verification limits.
 """
 
-PROVIDERS = ("anthropic", "google", "kimi", "openai", "openai-legacy")
+PROVIDERS = ("anthropic", "codex", "google", "kimi", "openai", "openai-legacy")
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
+    "codex": "gpt-5.6-sol",
     "google": "gemini-3.7-flash",
     "kimi": "kimi-k3",
     "openai": "gpt-5.6-sol",
@@ -142,6 +143,10 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
         model = DEFAULT_MODELS[provider]
 
     match provider:
+        case "codex":
+            from lazarus.codex_chatgpt import CodexChatGPT
+
+            chat = CodexChatGPT(model=model)
         case "kimi":
             from kosong.chat_provider.kimi import Kimi
 
