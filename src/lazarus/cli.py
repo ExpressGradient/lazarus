@@ -403,6 +403,8 @@ async def run_request(
         token_totals.add(step.usage)
         _print_token_usage(token_totals)
         history.append(step.message)
+        if text := step.message.extract_text():
+            print(f"\n[assistant]\n{text}")
         results = await step.tool_results()
         result_messages = [_tool_message(result) for result in results]
         history.extend(result_messages)
@@ -430,7 +432,6 @@ async def run_request(
             print(f"\n[steer]\n{steer_message}")
 
         if not results:
-            print(f"\n[assistant]\n{step.message.extract_text()}")
             return history
 
 
