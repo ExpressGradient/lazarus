@@ -45,6 +45,12 @@ Start a fresh context loop earlier, for example at 150,000 tokens:
 lazarus --loop-token-limit 150000
 ```
 
+Change the maximum tool output kept in context, for example to 64 KiB:
+
+```sh
+lazarus --tool-output-limit-kib 64
+```
+
 Quit an interactive session with `/quit`.
 
 ## Providers
@@ -71,10 +77,14 @@ in an extra message field can set `OPENAI_REASONING_KEY`, such as
 
 IPython runs in a child process. Requests and results use a private JSON channel,
 so Python and subprocess output cannot corrupt the protocol. Standard input is
-detached from that channel, output is capped before returning it to the model,
-and names remain alive until Lazarus exits or the worker process dies. Concurrent
-tool requests are serialized, and each displayed call stays paired with its
-result.
+detached from that channel, and names remain alive until Lazarus exits or the
+worker process dies. Concurrent tool requests are serialized, and each displayed
+call stays paired with its result.
+
+Tool output is capped at 48 KiB by default across stdout and stderr. Truncation
+keeps the first third and final two thirds. Lazarus saves the complete output in
+a temporary file and gives the model its path for targeted reads. It keeps the
+latest 20 files across worker restarts and removes them when Lazarus exits.
 
 When `start_new_loop` succeeds, Lazarus retains only:
 
@@ -113,3 +123,7 @@ The implementation is intentionally small:
 src/lazarus/cli.py            providers, tools, and agent loop
 src/lazarus/python_worker.py  persistent IPython worker
 ```
+
+## License
+
+MIT

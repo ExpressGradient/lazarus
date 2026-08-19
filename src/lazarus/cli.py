@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import cast
 
@@ -56,6 +57,7 @@ NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
 DEFAULT_LOOP_TOKEN_LIMIT = 250_000
 DEFAULT_CELL_TIMEOUT = 300.0
+DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
 
 
 @dataclass
@@ -119,6 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TOKENS",
         help="Steer the model to start a new loop at this context size (default: 250k).",
     )
+    parser.add_argument(
+        "--tool-output-limit-kib",
+        type=int,
+        default=DEFAULT_TOOL_OUTPUT_LIMIT_KIB,
+        metavar="KIB",
+        help="Maximum tool output kept in context (default: 48 KiB).",
+    )
     parser.add_argument("--prompt", help="Run one request and exit.")
     return parser
 
@@ -178,11 +187,19 @@ class CellParams(BaseModel):
 
 
 class PythonRuntime:
-    def __init__(self) -> None:
+    def __init__(
+        self, tool_output_limit_kib: int = DEFAULT_TOOL_OUTPUT_LIMIT_KIB
+    ) -> None:
+        if tool_output_limit_kib <= 0:
+            raise ValueError("tool output limit must be positive")
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
         self._reader_transport: asyncio.ReadTransport | None = None
         self._lock = asyncio.Lock()
+        self._tool_output_limit_bytes = tool_output_limit_kib * 1024
+        self._tool_output_dir = tempfile.TemporaryDirectory(
+            prefix="lazarus-tool-output-"
+        )
         self.cwd = os.getcwd()
 
     async def run(
@@ -257,6 +274,8 @@ class PythonRuntime:
             "-m",
             "lazarus.python_worker",
             str(write_fd),
+            str(self._tool_output_limit_bytes),
+            self._tool_output_dir.name,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -315,6 +334,7 @@ class PythonRuntime:
     async def close(self) -> None:
         async with self._lock:
             await self._forget_worker()
+            self._tool_output_dir.cleanup()
 
 
 class CellTool(CallableTool2[CellParams]):
@@ -334,6 +354,10 @@ def _cell_output(response: dict[str, object]) -> str:
         parts.append(str(stdout).rstrip())
     if stderr := response.get("stderr"):
         parts.append(f"[stderr]\n{str(stderr).rstrip()}")
+    if output_path := response.get("output_path"):
+        parts.append(
+            f"[full output: {output_path}; inspect targeted sections only]"
+        )
     return "\n".join(parts)
 
 
@@ -435,8 +459,13 @@ async def run_request(
             return history
 
 
-async def run(chat: ChatProvider, prompt: str | None, loop_token_limit: int) -> None:
-    runtime = PythonRuntime()
+async def run(
+    chat: ChatProvider,
+    prompt: str | None,
+    loop_token_limit: int,
+    tool_output_limit_kib: int,
+) -> None:
+    runtime = PythonRuntime(tool_output_limit_kib)
     toolset = SimpleToolset(
         [
             CellTool(
@@ -491,9 +520,18 @@ async def run(chat: ChatProvider, prompt: str | None, loop_token_limit: int) -> 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.tool_output_limit_kib <= 0:
+        parser.error("--tool-output-limit-kib must be positive")
     try:
         chat = create_chat_provider(args)
-        asyncio.run(run(chat, args.prompt, args.loop_token_limit))
+        asyncio.run(
+            run(
+                chat,
+                args.prompt,
+                args.loop_token_limit,
+                args.tool_output_limit_kib,
+            )
+        )
     except KeyboardInterrupt:
         print("\nStopped.")
     except Exception as exc:
