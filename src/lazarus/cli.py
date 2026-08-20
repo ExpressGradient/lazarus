@@ -56,7 +56,7 @@ THINKING_EFFORTS = ("off", "low", "medium", "high", "xhigh", "max")
 PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
-DEFAULT_LOOP_TOKEN_LIMIT = 250_000
+DEFAULT_LOOP_TOKEN_LIMIT = 150_000
 DEFAULT_CELL_TIMEOUT = 300.0
 DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
 
@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_LOOP_TOKEN_LIMIT,
         metavar="TOKENS",
-        help="Steer the model to start a new loop at this context size (default: 250k).",
+        help="Steer the model to start a new loop at this context size (default: 150k).",
     )
     parser.add_argument(
         "--tool-output-limit-kib",

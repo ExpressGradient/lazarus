@@ -13,7 +13,7 @@ Both tools default to a 300-second timeout. The model can set `timeout` on any
 call when a cell needs more or less time.
 
 The model decides when to start a new loop. Lazarus also steers it toward a
-handoff when the current context reaches 250,000 tokens. The handoff cell is
+handoff when the current context reaches 150,000 tokens. The handoff cell is
 ordinary, free-form Python. It can preserve notes, functions, objects, relevant
 file slices, commands, and anything else the next loop needs. There is no
 checkpoint schema or helper API.
@@ -39,10 +39,10 @@ Run one request and exit:
 lazarus --prompt "fix the failing tests"
 ```
 
-Start a fresh context loop earlier, for example at 150,000 tokens:
+Set a different context-loop threshold, for example 250,000 tokens:
 
 ```sh
-lazarus --loop-token-limit 150000
+lazarus --loop-token-limit 250000
 ```
 
 Change the maximum tool output kept in context, for example to 64 KiB:
@@ -109,7 +109,7 @@ system prompt.
 
 Automatic steering uses the size of the latest context, not cumulative billing
 usage. Cached and uncached input are counted once, along with the latest output.
-At 250,000 tokens by default, Lazarus adds one user message asking the model to
+At 150,000 tokens by default, Lazarus adds one user message asking the model to
 compact its useful state into a handoff and call `start_new_loop`. Change the
 threshold with `--loop-token-limit`. A successful reset clears that loop's
 steering state while lifetime usage totals continue accumulating.
