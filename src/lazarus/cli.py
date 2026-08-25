@@ -58,6 +58,7 @@ NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
 DEFAULT_LOOP_TOKEN_LIMIT = 150_000
 DEFAULT_CELL_TIMEOUT = 300.0
+CELL_INTERRUPT_GRACE = 10.0
 DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
 
 
@@ -219,12 +220,7 @@ class PythonRuntime:
             try:
                 result = await asyncio.wait_for(self._run_locked(code), timeout)
             except TimeoutError:
-                await self._forget_worker()
-                result = ToolError(
-                    message=f"Cell exceeded the {timeout:g}s timeout; interpreter state was lost.",
-                    output="",
-                    brief="Cell timed out",
-                )
+                result = await self._interrupt_timed_out_cell(timeout)
             if display_name is not None:
                 _print_result(result)
             return result
@@ -265,6 +261,46 @@ class PythonRuntime:
             message=str(response.get("error", "IPython cell failed")),
             output=output,
             brief="Cell failed",
+        )
+
+    async def _interrupt_timed_out_cell(self, timeout: float) -> ToolReturnValue:
+        process = self._process
+        reader = self._reader
+        if process is not None and process.returncode is None and reader is not None:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGINT)
+                else:
+                    process.send_signal(signal.SIGINT)
+                raw_response = await asyncio.wait_for(
+                    reader.readline(), CELL_INTERRUPT_GRACE
+                )
+                if raw_response:
+                    response = json.loads(raw_response)
+                    if isinstance(response.get("cwd"), str):
+                        self.cwd = response["cwd"]
+                    return ToolError(
+                        message=(
+                            f"Cell exceeded the {timeout:g}s timeout and was interrupted; "
+                            "interpreter state was preserved."
+                        ),
+                        output=_cell_output(response),
+                        brief="Cell timed out",
+                    )
+            except (
+                OSError,
+                TimeoutError,
+                ConnectionResetError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                pass
+
+        await self._forget_worker()
+        return ToolError(
+            message=f"Cell exceeded the {timeout:g}s timeout; interpreter state was lost.",
+            output="",
+            brief="Cell timed out",
         )
 
     async def _ensure_worker(self) -> None:

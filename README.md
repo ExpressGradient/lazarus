@@ -10,7 +10,9 @@ The model has two tools:
   and continues with the same IPython process.
 
 Both tools default to a 300-second timeout. The model can set `timeout` on any
-call when a cell needs more or less time.
+call when a cell needs more or less time. A timed-out cell is interrupted first
+so interpreter state survives; the worker is restarted only if it cannot
+recover within ten seconds.
 
 The model decides when to start a new loop. Lazarus also steers it toward a
 handoff when the current context reaches 150,000 tokens. The handoff cell is
