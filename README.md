@@ -83,6 +83,31 @@ server; if omitted, it uses OpenAI's default endpoint. APIs that return thinking
 in an extra message field can set `OPENAI_REASONING_KEY`, such as
 `reasoning_content`.
 
+## Skills
+
+Lazarus can discover skills installed with the Skills CLI's `--agent universal`
+option:
+
+```sh
+# Install for the current project (.agents/skills/)
+bunx skills add <repo-or-path> --agent universal
+
+# Install globally (~/.config/agents/skills/)
+bunx skills add <repo-or-path> --agent universal --global
+
+# Example: Vercel's browser automation skill
+bunx skills add vercel-labs/agent-browser --agent universal
+```
+
+You can also place skill folders in these directories manually. Each skill has a
+`SKILL.md` with instructions and may include scripts and references. Install any
+CLI tools or dependencies and configure API keys required by the skill.
+
+Lazarus is instructed to discover relevant skills through Python, read their
+instructions, and creatively combine their tools and helpers.
+Discovery happens when the model finds it useful; no skill catalog is added to
+the prompt.
+
 ## Execution model
 
 IPython runs in a child process. Requests and results use a private JSON channel,

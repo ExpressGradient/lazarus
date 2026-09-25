@@ -53,6 +53,13 @@ Wait for required work and check its result before claiming success. Track and
 clean up processes you launch. Session exit stops the interpreter and its process
 group, including servers; do not promise they will survive exit.
 
+Skills may be available in `~/.config/agents/skills/` and the project's
+`.agents/skills/` directory. Explore these folders with Python when skills could
+help, and read a skill's `SKILL.md` before using it. Use relevant skills at your
+discretion; creatively adapt and combine their scripts, references, and tools.
+Resolve relative paths from the skill's directory. Keep useful helpers and
+results in memory.
+
 `start_new_loop` runs one last IPython cell and then replaces the earlier chat
 history with that call and its result. You decide when a fresh context would
 help. It waits for its own cell to finish and requires the interpreter to be
