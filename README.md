@@ -58,11 +58,16 @@ Change the maximum tool output kept in context, for example to 64 KiB:
 lazarus --tool-output-limit-kib 64
 ```
 
-Quit an interactive session with `/quit`.
+Quit an interactive session with `/quit`. Ctrl-C stops the current turn and
+returns to the input prompt. Python state survives when the worker can be
+interrupted; if it must be killed, Lazarus reports that state was lost.
 
-Tool calls show short status lines by default. Use `--verbose` to see full
-Python code and tool output; full results always reach the model and remain in
-the session journal and job logs.
+Tool calls show a one-line description of their purpose, completion status, and
+up to three short lines of output by default. Cells accept a `description`
+argument; if omitted, a short code preview is shown instead. Long output is
+marked with `…`. Use `--verbose` to see full Python code and returned tool output.
+Terminal previews do not shorten model results, which use the configured output
+limit. Complete output stays in job logs.
 
 Interactive replies show the latest context size separately from cumulative
 session input/output tokens, including cached input. Context is the last model
@@ -132,10 +137,15 @@ model-driven.
 
 ## Execution model
 
-IPython runs in a child process. Requests and results use a private JSON channel,
-so Python and subprocess output cannot corrupt the protocol. Standard input is
+IPython runs in a child process. Requests and result metadata use a private JSON
+channel; output goes directly to one live job log, which the host reads and
+truncates for context. Python and subprocess output cannot corrupt the protocol. Standard input is
 detached from that channel. Names, functions, imports, and objects survive calls
 and context resets, until the worker or session exits.
+
+The complete assistant response is journaled before any tool call executes.
+A dropped model stream cannot dispatch a partial response. Interrupted calls
+are marked as uncertain and are never automatically replayed.
 
 One cell runs at a time. A second cell or handoff receives a busy error without
 executing. Job observation stays responsive because it runs in the host process.
@@ -199,7 +209,9 @@ lazarus --session-dir ./my-session --prompt "fix the failing tests"
 lazarus --resume ./my-session
 ```
 
-Resume restores the conversation and task with a **fresh interpreter**. It never
+Resume restores the conversation, task, and last known working directory with a
+**fresh interpreter**, keeping the original system prompt. It reads the journal
+one record at a time instead of loading discarded context loops into memory. It never
 replays cells or restores live Python objects. It explicitly marks missing tool
 results as unknown and tells the model to inspect files, logs, and any surviving
 processes before retrying. Only a partial final journal write is trimmed during

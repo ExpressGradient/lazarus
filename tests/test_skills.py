@@ -6,11 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from kosong.chat_provider import TokenUsage
 from kosong.message import Message, ToolCall
-from kosong.tooling import ToolOk
 
 from lazarus.cli import run
 from lazarus.skills import discover_skills, skills_prompt
@@ -80,9 +79,8 @@ class SkillTests(unittest.TestCase):
         path = self.skill(self.cwd, "stable", "Original description")
         calls = []
 
-        async def step(**kwargs):
+        async def generate(**kwargs):
             calls.append(kwargs["system_prompt"])
-            results = []
             tool_calls = []
             if len(calls) == 1:
                 path.write_text("broken after session starts")
@@ -94,25 +92,19 @@ class SkillTests(unittest.TestCase):
                         ),
                     )
                 ]
-                results = [
-                    SimpleNamespace(
-                        tool_call_id="reset", return_value=ToolOk(output="state")
-                    )
-                ]
             return SimpleNamespace(
                 message=Message(
                     role="assistant", content="done", tool_calls=tool_calls
                 ),
                 tool_calls=tool_calls,
                 usage=TokenUsage(input_other=100, input_cache_read=200, output=10),
-                tool_results=AsyncMock(return_value=results),
             )
 
         chat = SimpleNamespace(name="test", model_name="test")
         session = str(self.root / "session")
         with (
             patch("os.getcwd", return_value=str(self.cwd)),
-            patch("lazarus.cli.kosong.step", side_effect=step),
+            patch("lazarus.cli.kosong.generate", side_effect=generate),
             patch("builtins.input", side_effect=["first", "second", "/quit"]),
             redirect_stdout(StringIO()),
         ):

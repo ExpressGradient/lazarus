@@ -1,11 +1,14 @@
 from contextlib import redirect_stdout
 from io import StringIO
 import json
+from os import terminal_size
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from kosong.chat_provider import TokenUsage
+from kosong.tooling import ToolOk
 
 from lazarus.cli import (
     CellParams,
@@ -33,7 +36,8 @@ class DisplayTests(unittest.IsolatedAsyncioTestCase):
                 with redirect_stdout(screen):
                     result = await cell(
                         CellParams(
-                            code="import time\nprint('FULL_RESULT_MARKER')\ntime.sleep(.2)"
+                            code="import time\nprint('First result\\n' + 'x'*500 + '\\nThird result\\nFULL_RESULT_MARKER')\ntime.sleep(.2)",
+                            description="Read the browser instructions",
                         )
                     )
                     job_id = json.loads(result.output)["job_id"]
@@ -45,12 +49,20 @@ class DisplayTests(unittest.IsolatedAsyncioTestCase):
                     "FULL_RESULT_MARKER", Path(data["output_path"]).read_text()
                 )
                 self.assertNotIn("FULL_RESULT_MARKER", screen.getvalue())
+                self.assertIn("Read the browser instructions", screen.getvalue())
+                self.assertIn("First result", screen.getvalue())
+                self.assertIn("Third result", screen.getvalue())
+                self.assertIn("…", screen.getvalue())
+                self.assertNotIn("x" * 121, screen.getvalue())
+                self.assertNotIn("import time", screen.getvalue())
                 self.assertNotIn('"job_id"', screen.getvalue())
                 self.assertEqual(screen.getvalue().count("completed"), 1)
                 with redirect_stdout(screen):
                     failed = await cell(
                         CellParams(
-                            code="raise ValueError('visible failure')", yield_after=5
+                            code="raise ValueError('visible failure')",
+                            description="Check failure reporting",
+                            yield_after=5,
                         )
                     )
                 self.assertTrue(failed.is_error)
@@ -67,6 +79,46 @@ class DisplayTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await jobs.close()
                 await runtime.close()
+
+    def test_incremental_preview_deduplicates_reads_and_sanitizes_terminal_text(self):
+        display = ToolDisplay()
+        screen = StringIO()
+
+        def result(status, output, cursor):
+            return ToolOk(
+                output=json.dumps(
+                    dict(job_id="abc", status=status, output=output, cursor=cursor)
+                )
+            )
+
+        with (
+            redirect_stdout(screen),
+            patch(
+                "lazarus.display.shutil.get_terminal_size",
+                return_value=terminal_size((60, 24)),
+            ),
+        ):
+            display.cell("python", "print('fallback code')")
+            display.result(result("running", "", 0), label="Read\ninstructions")
+            display.result(
+                result("running", "\x1b[31mfirst\x1b[0m\x00\n" + "x" * 200, 220)
+            )
+            display.result(
+                result("running", "\x1b[31mfirst\x1b[0m\x00\n" + "x" * 200, 220)
+            )
+            display.result(result("running", "second", 226))
+            display.result(result("completed", "", 226))
+            display.result(result("completed", "", 226))
+        rendered = screen.getvalue()
+        self.assertIn("print('fallback code')", rendered)
+        self.assertIn("Read instructions · completed", rendered)
+        self.assertEqual(rendered.count("first"), 1)
+        self.assertEqual(rendered.count("second"), 1)
+        self.assertEqual(rendered.count("completed"), 1)
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("\x00", rendered)
+        self.assertIn("…", rendered)
+        self.assertTrue(all(len(line) <= 60 for line in rendered.splitlines()))
 
     def test_latest_context_is_not_cumulative_usage(self):
         totals = TokenTotals()

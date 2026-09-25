@@ -1,8 +1,5 @@
 import json
-from contextlib import ExitStack
 import os
-from pathlib import Path
-import shutil
 import signal
 import sys
 import tempfile
@@ -17,17 +14,10 @@ os.environ.setdefault(
 )
 
 
-MAX_OUTPUT_BYTES = 48 * 1024
-MAX_SAVED_OUTPUTS = 20
-
-
 class CellResult(TypedDict):
     ok: bool
-    stdout: str
-    stderr: str
     error: NotRequired[str]
     cwd: NotRequired[str]
-    output_path: NotRequired[str]
 
 
 def create_shell() -> InteractiveShell:
@@ -35,62 +25,6 @@ def create_shell() -> InteractiveShell:
     config.HistoryManager.hist_file = ":memory:"
     config.InteractiveShell.colors = "nocolor"
     return InteractiveShell.instance(config=config)
-
-
-def _read_stream(file: BinaryIO, limit: int) -> str:
-    file.flush()
-    size = file.seek(0, os.SEEK_END)
-    file.seek(0)
-    if size <= limit:
-        data = file.read()
-    else:
-        head_size = limit // 3
-        tail_size = limit - head_size
-        head = file.read(head_size)
-        file.seek(-tail_size, os.SEEK_END)
-        tail = file.read(tail_size)
-        omitted = size - limit
-        marker = f"\n... {omitted:,} output bytes omitted ...\n".encode()
-        data = head + marker + tail
-    return data.decode(errors="replace")
-
-
-def _stream_limits(
-    stdout_size: int, stderr_size: int, max_output_bytes: int = MAX_OUTPUT_BYTES
-) -> tuple[int, int]:
-    stdout_limit = min(stdout_size, max_output_bytes // 2)
-    stderr_limit = min(stderr_size, max_output_bytes // 2)
-    remaining = max_output_bytes - stdout_limit - stderr_limit
-    stdout_limit += min(remaining, stdout_size - stdout_limit)
-    remaining = max_output_bytes - stdout_limit - stderr_limit
-    stderr_limit += min(remaining, stderr_size - stderr_limit)
-    return stdout_limit, stderr_limit
-
-
-def _save_output(
-    stdout_file: BinaryIO,
-    stderr_file: BinaryIO,
-    output_dir: str,
-    output_index: int,
-) -> str:
-    directory = Path(output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"output-{os.getpid()}-{output_index:06d}.log"
-    with path.open("wb") as target:
-        target.write(b"[stdout]\n")
-        stdout_file.seek(0)
-        shutil.copyfileobj(stdout_file, target)
-        target.write(b"\n[stderr]\n")
-        stderr_file.seek(0)
-        shutil.copyfileobj(stderr_file, target)
-
-    saved = sorted(
-        directory.glob("output-*.log"),
-        key=lambda item: (item.stat().st_mtime_ns, item.name),
-    )
-    for old_path in saved[:-MAX_SAVED_OUTPUTS]:
-        old_path.unlink()
-    return str(path)
 
 
 def _flush(stream: object) -> None:
@@ -103,37 +37,18 @@ def _flush(stream: object) -> None:
         pass
 
 
-def execute_cell(
-    shell: InteractiveShell,
-    code: str,
-    max_output_bytes: int = MAX_OUTPUT_BYTES,
-    output_dir: str | None = None,
-    output_index: int = 0,
-    live_output_path: str | None = None,
-) -> CellResult:
+def execute_cell(shell: InteractiveShell, code: str, output_path: str) -> CellResult:
     base_stdout = sys.__stdout__
     base_stderr = sys.__stderr__
 
-    with ExitStack() as stack:
-        stdout_file = stack.enter_context(
-            open(live_output_path, "a+b")
-            if live_output_path is not None
-            else tempfile.TemporaryFile(mode="w+b")
-        )
-        # One log preserves the arrival order of stdout and stderr and is
-        # readable by the supervisor while the interpreter is busy. Append
-        # mode keeps inherited child writes safe while we seek to read output.
-        stderr_file = (
-            stdout_file
-            if live_output_path is not None
-            else stack.enter_context(tempfile.TemporaryFile(mode="w+b"))
-        )
+    # The host owns this single log. The worker never reads or truncates it.
+    with open(output_path, "ab", buffering=0) as output_file:
         saved_stdout_fd = os.dup(1)
         saved_stderr_fd = os.dup(2)
         _flush(sys.stdout)
         _flush(sys.stderr)
-        os.dup2(stdout_file.fileno(), 1)
-        os.dup2(stderr_file.fileno(), 2)
+        os.dup2(output_file.fileno(), 1)
+        os.dup2(output_file.fileno(), 2)
         sys.stdout = base_stdout
         sys.stderr = base_stderr
 
@@ -155,39 +70,13 @@ def execute_cell(
             sys.stdout = base_stdout
             sys.stderr = base_stderr
 
-        stdout_size = stdout_file.seek(0, os.SEEK_END)
-        stderr_size = 0 if live_output_path else stderr_file.seek(0, os.SEEK_END)
-        output_path = live_output_path
-        if (
-            not live_output_path
-            and output_dir is not None
-            and stdout_size + stderr_size > max_output_bytes
-        ):
-            try:
-                output_path = _save_output(
-                    stdout_file, stderr_file, output_dir, output_index
-                )
-            except OSError:
-                pass
-        stdout_limit, stderr_limit = _stream_limits(
-            stdout_size, stderr_size, max_output_bytes
-        )
-        stdout = _read_stream(stdout_file, stdout_limit)
-        stderr = "" if live_output_path else _read_stream(stderr_file, stderr_limit)
-
     error = infrastructure_error
     if error is None and result is not None:
         error = result.error_before_exec or result.error_in_exec
 
-    response: CellResult = {
-        "ok": error is None,
-        "stdout": stdout,
-        "stderr": stderr,
-    }
+    response: CellResult = {"ok": error is None}
     if error is not None:
-        response["error"] = f"{type(error).__name__}: {error}"
-    if output_path is not None:
-        response["output_path"] = output_path
+        response["error"] = f"{type(error).__name__}: {error}"[:4096]
     try:
         response["cwd"] = os.getcwd()
     except OSError:
@@ -205,15 +94,11 @@ def _protocol_input() -> BinaryIO:
 
 
 def main() -> None:
-    if len(sys.argv) != 4:
-        raise SystemExit("usage: python_worker RESPONSE_FD MAX_OUTPUT_BYTES OUTPUT_DIR")
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: python_worker RESPONSE_FD")
 
     requests = _protocol_input()
     responses = os.fdopen(int(sys.argv[1]), "w", encoding="utf-8", buffering=1)
-    max_output_bytes = int(sys.argv[2])
-    if max_output_bytes <= 0:
-        raise SystemExit("MAX_OUTPUT_BYTES must be positive")
-    output_dir = sys.argv[3]
     shell = create_shell()
     executing = False
 
@@ -225,25 +110,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, interrupt)
 
-    for output_index, raw_line in enumerate(requests, start=1):
+    for raw_line in requests:
         try:
             executing = True
             request = json.loads(raw_line)
-            response = execute_cell(
-                shell,
-                request["code"],
-                max_output_bytes,
-                output_dir,
-                output_index,
-                request.get("output_path"),
-            )
+            response = execute_cell(shell, request["code"], request["output_path"])
         except BaseException as exc:
-            response = {
-                "ok": False,
-                "stdout": "",
-                "stderr": "",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:4096]}
         finally:
             executing = False
         responses.write(json.dumps(response, ensure_ascii=False) + "\n")

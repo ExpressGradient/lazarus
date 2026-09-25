@@ -6,29 +6,19 @@ import os
 from pathlib import Path
 import signal
 import sys
-import tempfile
 
 from kosong.tooling import ToolError, ToolOk, ToolReturnValue
 
 DEFAULT_CELL_TIMEOUT = 300.0
 CELL_INTERRUPT_GRACE = 10.0
-DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
 
 
 class PythonRuntime:
-    def __init__(
-        self, tool_output_limit_kib: int = DEFAULT_TOOL_OUTPUT_LIMIT_KIB
-    ) -> None:
-        if tool_output_limit_kib <= 0:
-            raise ValueError("tool output limit must be positive")
+    def __init__(self) -> None:
         self._process: asyncio.subprocess.Process | None = None
         self._reader: asyncio.StreamReader | None = None
         self._reader_transport: asyncio.ReadTransport | None = None
         self._lock = asyncio.Lock()
-        self._tool_output_limit_bytes = tool_output_limit_kib * 1024
-        self._tool_output_dir = tempfile.TemporaryDirectory(
-            prefix="lazarus-tool-output-"
-        )
         self.cwd = os.getcwd()
         self.initial_cwd = self.cwd
         self.generation = 0
@@ -38,7 +28,7 @@ class PythonRuntime:
         code: str,
         timeout: float = DEFAULT_CELL_TIMEOUT,
         *,
-        output_path: Path | None = None,
+        output_path: Path,
         cancel: asyncio.Event | None = None,
     ) -> ToolReturnValue:
         async with self._lock:
@@ -73,9 +63,7 @@ class PythonRuntime:
                     cancellation.cancel()
                     await asyncio.gather(cancellation, return_exceptions=True)
 
-    async def _run_locked(
-        self, code: str, output_path: Path | None = None
-    ) -> ToolReturnValue:
+    async def _run_locked(self, code: str, output_path: Path) -> ToolReturnValue:
         try:
             await self._ensure_worker()
             assert self._process is not None
@@ -86,7 +74,7 @@ class PythonRuntime:
                 json.dumps(
                     {
                         "code": code,
-                        "output_path": str(output_path) if output_path else None,
+                        "output_path": str(output_path),
                     },
                     ensure_ascii=False,
                 )
@@ -113,12 +101,10 @@ class PythonRuntime:
 
         if isinstance(response.get("cwd"), str):
             self.cwd = response["cwd"]
-        output = _cell_output(response)
         if response.get("ok"):
-            return ToolOk(output=output or "(no output)")
+            return ToolOk(output="")
         return ToolError(
             message=str(response.get("error", "IPython cell failed")),
-            output=output,
             brief="Cell failed",
         )
 
@@ -144,7 +130,6 @@ class PythonRuntime:
                             f"{reason} and was interrupted; interpreter state was preserved. "
                             "Partial effects remain; inspect before retrying."
                         ),
-                        output=_cell_output(response),
                         brief=brief,
                     )
             except (
@@ -208,8 +193,6 @@ class PythonRuntime:
                 "-m",
                 "lazarus.python_worker",
                 str(write_fd),
-                str(self._tool_output_limit_bytes),
-                self._tool_output_dir.name,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -224,8 +207,8 @@ class PythonRuntime:
             os.close(write_fd)
 
         self.generation += 1
-        # JSON escaping can expand output by up to six bytes per byte.
-        reader = asyncio.StreamReader(limit=self._tool_output_limit_bytes * 6 + 65536)
+        # Only bounded status metadata crosses the pipe; output stays in the log.
+        reader = asyncio.StreamReader(limit=65536)
         protocol = asyncio.StreamReaderProtocol(reader)
         loop = asyncio.get_running_loop()
         transport, _ = await loop.connect_read_pipe(
@@ -275,15 +258,3 @@ class PythonRuntime:
     async def close(self) -> None:
         async with self._lock:
             await self._forget_worker()
-            self._tool_output_dir.cleanup()
-
-
-def _cell_output(response: dict[str, object]) -> str:
-    parts = []
-    if stdout := response.get("stdout"):
-        parts.append(str(stdout).rstrip())
-    if stderr := response.get("stderr"):
-        parts.append(f"[stderr]\n{str(stderr).rstrip()}")
-    if output_path := response.get("output_path"):
-        parts.append(f"[full output: {output_path}; inspect targeted sections only]")
-    return "\n".join(parts)

@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 from pathlib import Path
 import sys
 from dataclasses import dataclass
@@ -15,12 +16,11 @@ from kosong.tooling.simple import SimpleToolset
 from pydantic import BaseModel, ConfigDict, Field
 
 from lazarus.display import ToolDisplay, result_text
-from lazarus.jobs import Jobs
-from lazarus.session import Session
+from lazarus.jobs import DEFAULT_TOOL_OUTPUT_LIMIT_KIB, Jobs
+from lazarus.session import Session, pending_tool_calls
 from lazarus.skills import skills_prompt
 from lazarus.runtime import (
     DEFAULT_CELL_TIMEOUT,
-    DEFAULT_TOOL_OUTPUT_LIMIT_KIB,
     PythonRuntime,
 )
 
@@ -34,6 +34,7 @@ functions, objects, and IPython state survive every tool call and every new
 loop. It returns a job handle immediately by default; use `yield_after` to wait
 briefly for a result. `timeout` is a separate execution deadline (300 seconds
 by default). One cell runs at a time; a busy interpreter rejects new cells.
+Give each cell a short `description` of its purpose, shown to the user while it runs.
 
 `job` observes execution outside the interpreter. Pass `id` to read new output,
 `wait` to wait up to 60 seconds, or `cancel=true` to request interruption.
@@ -59,6 +60,8 @@ group, including servers; do not promise they will survive exit.
 history with that call and its result. You decide when a fresh context would
 help. It waits for its own cell to finish and requires the interpreter to be
 idle. Jobs and logs survive context resets. Use `job` to recover their handles.
+After a successful reset, continue the retained handoff's next action instead
+of restarting the original task or repeating its completed steps.
 
 The `start_new_loop` cell is a free-form handoff to your next loop. There is no
 required structure. Use normal Python: comments, variables, functions, cached
@@ -231,6 +234,9 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
 class CellParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: str
+    description: str = Field(
+        default="", description="Short, one-line description of what this cell does."
+    )
     timeout: float = Field(default=DEFAULT_CELL_TIMEOUT, gt=0, allow_inf_nan=False)
     yield_after: float = Field(default=0, ge=0, le=60, allow_inf_nan=False)
 
@@ -284,7 +290,7 @@ class CellTool(CallableTool2[CellParams]):
         self.display = display or ToolDisplay()
 
     async def __call__(self, params: CellParams) -> ToolReturnValue:
-        self.display.cell(self.name, params.code)
+        self.display.cell(self.name, params.code, params.description)
         if self.name == PYTHON_TOOL:
             result = await self.jobs.submit(
                 params.code, params.timeout, params.yield_after
@@ -293,7 +299,7 @@ class CellTool(CallableTool2[CellParams]):
             result = await self.jobs.submit(
                 params.code, params.timeout, 0, wait_completion=True
             )
-        self.display.result(result)
+        self.display.result(result, label=params.description.strip() or params.code)
         return result
 
 
@@ -310,10 +316,19 @@ def _new_loop_history(
 ) -> list[Message] | None:
     for call, result in reversed(list(zip(tool_calls, results, strict=True))):
         if call.function.name == NEW_LOOP_TOOL and not result.return_value.is_error:
+            handoff = Message(
+                role="tool",
+                tool_call_id=result.tool_call_id,
+                content=(
+                    "Context reset complete. Continue from the handoff above; "
+                    "do not repeat completed work. Python state was preserved.\n"
+                    + result_text(result.return_value)
+                ),
+            )
             return [
                 Message(role="user", content=task),
                 Message(role="assistant", content=[], tool_calls=[call]),
-                _tool_message(result),
+                handoff,
             ]
     return None
 
@@ -392,9 +407,9 @@ async def run_request(
 
     while True:
         append_completions()
-        step = await kosong.step(
+        step = await kosong.generate(
             chat_provider=chat,
-            toolset=toolset,
+            tools=toolset.tools,
             history=history,
             system_prompt=system_prompt,
         )
@@ -407,16 +422,22 @@ async def run_request(
         if text := step.message.extract_text():
             label = "Lazarus:" if interactive else "[assistant]"
             print(f"\n{label}\n{text}")
-        results = await step.tool_results()
-        for result in results:
+        # Nothing executes until the complete assistant message is durable.
+        # A dropped model stream can therefore be retried without replaying code.
+        tool_calls = step.message.tool_calls or []
+        results: list[ToolResult] = []
+        for call in tool_calls:
+            handled = toolset.handle(call)
+            result = handled if isinstance(handled, ToolResult) else await handled
+            results.append(result)
             append(_tool_message(result))
 
-        if new_history := _new_loop_history(user_input, step.tool_calls, results):
+        if new_history := _new_loop_history(user_input, tool_calls, results):
             token_totals.loops_started += 1
             token_totals.loop_context_tokens = 0
             token_totals.context_tokens = None
             token_totals.loop_steer_sent = False
-            history = new_history
+            history[:] = new_history
             if session:
                 session.record(
                     "reset",
@@ -461,8 +482,13 @@ async def run(
     verbose: bool = False,
 ) -> None:
     session = Session(resume or session_dir, resume=resume is not None)
-    runtime = PythonRuntime(tool_output_limit_kib)
-    jobs = Jobs(runtime, session.directory / "jobs", session.record)
+    runtime = PythonRuntime()
+    jobs = Jobs(
+        runtime,
+        session.directory / "jobs",
+        session.record,
+        tool_output_limit_kib=tool_output_limit_kib,
+    )
     display = ToolDisplay(verbose)
     toolset = SimpleToolset(
         [
@@ -486,6 +512,78 @@ async def run(
     # Resume uses its original catalog and instructions from the journal.
     system_prompt = ""
     interactive = prompt is None and sys.stdin.isatty() and sys.stdout.isatty()
+    previous_sigint = signal.getsignal(signal.SIGINT)
+
+    async def request(text: str, *, continuation: bool = False) -> list[Message]:
+        coroutine = run_request(
+            chat,
+            toolset,
+            runtime,
+            history,
+            text,
+            token_totals,
+            loop_token_limit,
+            jobs=jobs,
+            session=session,
+            system_prompt=system_prompt,
+            continuation=continuation,
+            interactive=interactive,
+            display=display,
+        )
+        if not interactive:
+            return await coroutine
+        turn = asyncio.create_task(coroutine)
+        interrupted = False
+
+        def stop_turn() -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                turn.cancel()
+
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, stop_turn)
+        try:
+            return await turn
+        except asyncio.CancelledError:
+            if not interrupted:
+                raise
+            print("\nStopping current turn…", flush=True)
+            await jobs.interrupt()
+            # Seal interrupted and undispatched calls before appending any
+            # user messages, keeping the next model request well-formed.
+            for call_id in pending_tool_calls(history):
+                message = Message(
+                    role="tool",
+                    tool_call_id=call_id,
+                    content="Turn interrupted by the user. This call may have run partially or not started. Inspect effects before retrying; nothing was replayed.",
+                )
+                session.message(message)
+                history.append(message)
+            for notice in jobs.notifications():
+                message = Message(role="user", content="[Job completion]\n" + notice)
+                session.message(message)
+                history.append(message)
+                display.result(ToolOk(output=notice))
+            if runtime._process is not None and runtime._process.returncode is None:
+                state = "Python state was preserved."
+            elif runtime.generation:
+                state = (
+                    "Python state was lost; the next cell starts a fresh interpreter."
+                )
+            else:
+                state = "No interpreter was started."
+            message = Message(
+                role="user",
+                content=f"The user stopped the previous turn. {state} Partial effects may remain. Wait for the next request before continuing.",
+            )
+            session.message(message)
+            history.append(message)
+            print(f"Stopped. {state}", flush=True)
+            return history
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.default_int_handler)
 
     print(f"Lazarus · {chat.name} · {chat.model_name}")
     session_path = str(session.directory)
@@ -495,50 +593,31 @@ async def run(
             session_path = str(Path("~") / session.directory.relative_to(home))
     print(f"Session: {session_path}")
     if interactive:
-        print("Type /quit to exit.")
+        print("Type /quit to exit. Ctrl-C stops the current turn.")
+        # Keep asyncio.run's handler from cancelling the entire session.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
     try:
         if resume:
             history, task, system_prompt, cwd = session.restore()
             runtime.cwd = cwd
             runtime.initial_cwd = cwd
             if prompt is None:
-                history = await run_request(
-                    chat,
-                    toolset,
-                    runtime,
-                    history,
-                    task,
-                    token_totals,
-                    loop_token_limit,
-                    jobs=jobs,
-                    session=session,
-                    system_prompt=system_prompt,
-                    continuation=True,
-                    interactive=interactive,
-                    display=display,
-                )
+                history = await request(task, continuation=True)
         else:
             system_prompt = _system_prompt(runtime.initial_cwd)
             session.record("session", system_prompt=system_prompt, cwd=runtime.cwd)
         if prompt is not None:
-            await run_request(
-                chat,
-                toolset,
-                runtime,
-                history,
-                prompt,
-                token_totals,
-                loop_token_limit,
-                jobs=jobs,
-                session=session,
-                system_prompt=system_prompt,
-                display=display,
-            )
+            await request(prompt)
             return
 
         while True:
             try:
                 user_input = input("\nYou: " if interactive else "\n> ")
+            except KeyboardInterrupt:
+                if not interactive:
+                    raise
+                print()
+                continue
             except EOFError:
                 if interactive:
                     print()
@@ -547,20 +626,7 @@ async def run(
                 continue
             if user_input.strip() == "/quit":
                 break
-            history = await run_request(
-                chat,
-                toolset,
-                runtime,
-                history,
-                user_input,
-                token_totals,
-                loop_token_limit,
-                jobs=jobs,
-                session=session,
-                system_prompt=system_prompt,
-                interactive=interactive,
-                display=display,
-            )
+            history = await request(user_input)
     finally:
         try:
             await jobs.close()
@@ -569,6 +635,8 @@ async def run(
                 await runtime.close()
             finally:
                 session.close()
+                if interactive:
+                    signal.signal(signal.SIGINT, previous_sigint)
 
 
 def main() -> None:

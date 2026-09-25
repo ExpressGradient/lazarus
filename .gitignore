@@ -18,3 +18,7 @@ env.sh
 /tests/*
 !/tests/test_skills.py
 !/tests/test_display.py
+!/tests/test_jobs.py
+!/tests/test_runtime.py
+!/tests/test_python_worker.py
+!/tests/test_recovery.py

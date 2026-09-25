@@ -14,6 +14,9 @@ from kosong.tooling import ToolError, ToolOk, ToolReturnValue
 from lazarus.runtime import PythonRuntime
 
 
+DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
+
+
 @dataclass
 class Job:
     id: str
@@ -34,7 +37,12 @@ class Jobs:
         runtime: PythonRuntime,
         directory: Path,
         record: Callable[..., None] | None = None,
+        *,
+        tool_output_limit_kib: int = DEFAULT_TOOL_OUTPUT_LIMIT_KIB,
     ) -> None:
+        if tool_output_limit_kib <= 0:
+            raise ValueError("tool output limit must be positive")
+        self._output_limit_bytes = tool_output_limit_kib * 1024
         self.runtime = runtime
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
@@ -120,6 +128,7 @@ class Jobs:
                 status=job.status,
                 message=job.result.message,
                 generation=self.runtime.generation,
+                cwd=self.runtime.cwd,
             )
 
     async def inspect(
@@ -155,7 +164,7 @@ class Jobs:
 
     def snapshot(self, job: Job, cursor: int | None = None) -> dict[str, object]:
         start = job.cursor if cursor is None else cursor
-        limit = self.runtime._tool_output_limit_bytes
+        limit = self._output_limit_bytes
         with job.output_path.open("rb") as log:
             end = log.seek(0, 2)
             if start > end:
@@ -217,6 +226,9 @@ class Jobs:
 
     async def close(self) -> None:
         self.closed = True
+        await self.interrupt()
+
+    async def interrupt(self) -> None:
         for job in self.jobs.values():
             if job.status == "running":
                 job.cancel.set()
