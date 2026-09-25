@@ -92,7 +92,7 @@ option:
 # Install for the current project (.agents/skills/)
 bunx skills add <repo-or-path> --agent universal
 
-# Install globally (~/.config/agents/skills/)
+# Install globally (~/.agents/skills/)
 bunx skills add <repo-or-path> --agent universal --global
 
 # Example: Vercel's browser automation skill
@@ -103,10 +103,11 @@ You can also place skill folders in these directories manually. Each skill has a
 `SKILL.md` with instructions and may include scripts and references. Install any
 CLI tools or dependencies and configure API keys required by the skill.
 
-Lazarus is instructed to discover relevant skills through Python, read their
-instructions, and creatively combine their tools and helpers.
-Discovery happens when the model finds it useful; no skill catalog is added to
-the prompt.
+For tasks needing current information or external tools, the prompt instructs
+Lazarus to check these folders before choosing an approach. It reads relevant
+skill instructions and can creatively combine their tools and helpers, or use
+Python directly if none fit. Discovery is model-driven; no skill catalog is
+added to the prompt.
 
 ## Execution model
 

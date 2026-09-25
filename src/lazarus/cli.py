@@ -53,10 +53,12 @@ Wait for required work and check its result before claiming success. Track and
 clean up processes you launch. Session exit stops the interpreter and its process
 group, including servers; do not promise they will survive exit.
 
-Skills may be available in `~/.config/agents/skills/` and the project's
-`.agents/skills/` directory. Explore these folders with Python when skills could
-help, and read a skill's `SKILL.md` before using it. Use relevant skills at your
-discretion; creatively adapt and combine their scripts, references, and tools.
+Skills may be available in `~/.agents/skills/` and the project's
+`.agents/skills/` directory. When a task needs current information or external
+tools, check these folders for relevant skills before choosing an approach.
+Read relevant `SKILL.md` files and use the skills that fit, following their
+instructions. Creatively wrap and combine their scripts, references, and tools
+through Python. If none fit or a skill is unavailable, use Python directly.
 Resolve relative paths from the skill's directory. Keep useful helpers and
 results in memory.
 
