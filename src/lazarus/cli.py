@@ -14,8 +14,10 @@ from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolResult, ToolRet
 from kosong.tooling.simple import SimpleToolset
 from pydantic import BaseModel, ConfigDict, Field
 
+from lazarus.display import ToolDisplay, result_text
 from lazarus.jobs import Jobs
 from lazarus.session import Session
+from lazarus.skills import skills_prompt
 from lazarus.runtime import (
     DEFAULT_CELL_TIMEOUT,
     DEFAULT_TOOL_OUTPUT_LIMIT_KIB,
@@ -52,15 +54,6 @@ a durable background job: the interpreter's event loop may stop between cells.
 Wait for required work and check its result before claiming success. Track and
 clean up processes you launch. Session exit stops the interpreter and its process
 group, including servers; do not promise they will survive exit.
-
-Skills may be available in `~/.agents/skills/` and the project's
-`.agents/skills/` directory. When a task needs current information or external
-tools, check these folders for relevant skills before choosing an approach.
-Read relevant `SKILL.md` files and use the skills that fit, following their
-instructions. Creatively wrap and combine their scripts, references, and tools
-through Python. If none fit or a skill is unavailable, use Python directly.
-Resolve relative paths from the skill's directory. Keep useful helpers and
-results in memory.
 
 `start_new_loop` runs one last IPython cell and then replaces the earlier chat
 history with that call and its result. You decide when a fresh context would
@@ -102,10 +95,12 @@ class TokenTotals:
     output: int = 0
     loops_started: int = 0
     loop_context_tokens: int = 0
+    context_tokens: int | None = None
     loop_steer_sent: bool = False
 
     def add(self, usage: TokenUsage | None) -> None:
         if usage is None:
+            self.context_tokens = None
             return
         self.input_other += usage.input_other
         self.input_cache_read += usage.input_cache_read
@@ -117,6 +112,7 @@ class TokenTotals:
             + usage.input_cache_creation
             + usage.output
         )
+        self.context_tokens = self.loop_context_tokens
 
     @property
     def input(self) -> int:
@@ -126,7 +122,7 @@ class TokenTotals:
     def total(self) -> int:
         return self.input + self.output
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, int | None]:
         return {
             "input": self.input,
             "input_other": self.input_other,
@@ -135,6 +131,7 @@ class TokenTotals:
             "output": self.output,
             "total": self.total,
             "loops_started": self.loops_started,
+            "context": self.context_tokens,
         }
 
 
@@ -163,6 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tool output kept in context (default: 48 KiB).",
     )
     parser.add_argument("--prompt", help="Run one request and exit.")
+    parser.add_argument(
+        "--verbose", action="store_true", help="Show full Python code and tool output."
+    )
     sessions = parser.add_mutually_exclusive_group()
     sessions.add_argument(
         "--session-dir", help="New session directory for the journal and job logs."
@@ -246,12 +246,13 @@ class JobParams(BaseModel):
 class JobTool(CallableTool2[JobParams]):
     params = JobParams
 
-    def __init__(self, jobs: Jobs) -> None:
+    def __init__(self, jobs: Jobs, display: ToolDisplay | None = None) -> None:
         super().__init__(
             name="job",
             description="Read, wait for, or cancel a Python job without blocking the interpreter. Omit id to list jobs.",
         )
         self.jobs = jobs
+        self.display = display or ToolDisplay()
 
     async def __call__(self, params: JobParams) -> ToolReturnValue:
         if params.id is None:
@@ -264,19 +265,26 @@ class JobTool(CallableTool2[JobParams]):
         result = await self.jobs.inspect(
             params.id, wait=params.wait, cancel=params.cancel, cursor=params.cursor
         )
-        _print_result(result)
+        self.display.result(result)
         return result
 
 
 class CellTool(CallableTool2[CellParams]):
     params = CellParams
 
-    def __init__(self, jobs: Jobs, name: str, description: str) -> None:
+    def __init__(
+        self,
+        jobs: Jobs,
+        name: str,
+        description: str,
+        display: ToolDisplay | None = None,
+    ) -> None:
         super().__init__(name=name, description=description)
         self.jobs = jobs
+        self.display = display or ToolDisplay()
 
     async def __call__(self, params: CellParams) -> ToolReturnValue:
-        _print_cell(self.name, params.code)
+        self.display.cell(self.name, params.code)
         if self.name == PYTHON_TOOL:
             result = await self.jobs.submit(
                 params.code, params.timeout, params.yield_after
@@ -285,7 +293,7 @@ class CellTool(CallableTool2[CellParams]):
             result = await self.jobs.submit(
                 params.code, params.timeout, 0, wait_completion=True
             )
-        _print_result(result)
+        self.display.result(result)
         return result
 
 
@@ -293,7 +301,7 @@ def _tool_message(result: ToolResult) -> Message:
     return Message(
         role="tool",
         tool_call_id=result.tool_call_id,
-        content=_result_text(result.return_value),
+        content=result_text(result.return_value),
     )
 
 
@@ -310,27 +318,23 @@ def _new_loop_history(
     return None
 
 
-def _print_cell(name: str, code: str) -> None:
-    print(f"\n[{name}]\n{code}")
-
-
-def _print_result(value: ToolReturnValue) -> None:
-    label = "error" if value.is_error else "output"
-    print(f"\n[{label}]\n{_result_text(value)}")
-
-
-def _result_text(value: ToolReturnValue) -> str:
-    parts = [str(value.output)] if value.output else []
-    if value.message:
-        parts.append(value.message)
-    return "\n".join(parts).rstrip() or "(no output)"
-
-
 def _print_token_usage(totals: TokenTotals, *, interactive: bool = False) -> None:
     if interactive:
         if totals.total:
+            context = (
+                f"{totals.context_tokens:,} tokens (last call)"
+                if totals.context_tokens is not None
+                else "unavailable"
+            )
+            cache_write = (
+                f", {totals.input_cache_creation:,} cache write"
+                if totals.input_cache_creation
+                else ""
+            )
+            print(f"\nContext · {context}")
             print(
-                f"\nSession tokens · {totals.input:,} in · {totals.output:,} out"
+                f"Session tokens · {totals.input:,} in "
+                f"({totals.input_cache_read:,} cached{cache_write}) · {totals.output:,} out"
                 f" · {totals.total:,} total"
             )
         return
@@ -338,7 +342,10 @@ def _print_token_usage(totals: TokenTotals, *, interactive: bool = False) -> Non
 
 
 def _system_prompt(cwd: str) -> str:
-    return SYSTEM_PROMPT.format(cwd=cwd)
+    catalog, warnings = skills_prompt(Path(cwd))
+    for warning in warnings:
+        print(f"Skill warning: {warning}", file=sys.stderr)
+    return SYSTEM_PROMPT.format(cwd=cwd) + catalog
 
 
 async def run_request(
@@ -355,7 +362,10 @@ async def run_request(
     system_prompt: str | None = None,
     continuation: bool = False,
     interactive: bool = False,
+    display: ToolDisplay | None = None,
 ) -> list[Message]:
+    display = display or ToolDisplay()
+
     def append(message: Message) -> None:
         if session:
             session.message(message)
@@ -367,7 +377,8 @@ async def run_request(
             append(
                 Message(role="user", content="[Job completion]\n" + "\n".join(notices))
             )
-            print("\n[job completion]\n" + "\n".join(notices))
+            for notice in notices:
+                display.result(ToolOk(output=notice))
         return bool(notices)
 
     if not continuation:
@@ -388,6 +399,8 @@ async def run_request(
             system_prompt=system_prompt,
         )
         token_totals.add(step.usage)
+        if session:
+            session.record("usage", **token_totals.as_dict())
         if not interactive:
             _print_token_usage(token_totals)
         append(step.message)
@@ -401,6 +414,7 @@ async def run_request(
         if new_history := _new_loop_history(user_input, step.tool_calls, results):
             token_totals.loops_started += 1
             token_totals.loop_context_tokens = 0
+            token_totals.context_tokens = None
             token_totals.loop_steer_sent = False
             history = new_history
             if session:
@@ -444,28 +458,33 @@ async def run(
     tool_output_limit_kib: int,
     session_dir: str | None = None,
     resume: str | None = None,
+    verbose: bool = False,
 ) -> None:
     session = Session(resume or session_dir, resume=resume is not None)
     runtime = PythonRuntime(tool_output_limit_kib)
     jobs = Jobs(runtime, session.directory / "jobs", session.record)
+    display = ToolDisplay(verbose)
     toolset = SimpleToolset(
         [
             CellTool(
                 jobs,
                 PYTHON_TOOL,
                 "Run a persistent IPython cell. Returns a job immediately; yield_after waits briefly. State survives calls and new loops.",
+                display,
             ),
             CellTool(
                 jobs,
                 NEW_LOOP_TOOL,
                 "Run a free-form handoff cell, replace chat history, and continue.",
+                display,
             ),
-            JobTool(jobs),
+            JobTool(jobs, display),
         ]
     )
     history: list[Message] = []
     token_totals = TokenTotals()
-    system_prompt = _system_prompt(runtime.initial_cwd)
+    # Resume uses its original catalog and instructions from the journal.
+    system_prompt = ""
     interactive = prompt is None and sys.stdin.isatty() and sys.stdout.isatty()
 
     print(f"Lazarus · {chat.name} · {chat.model_name}")
@@ -496,8 +515,10 @@ async def run(
                     system_prompt=system_prompt,
                     continuation=True,
                     interactive=interactive,
+                    display=display,
                 )
         else:
+            system_prompt = _system_prompt(runtime.initial_cwd)
             session.record("session", system_prompt=system_prompt, cwd=runtime.cwd)
         if prompt is not None:
             await run_request(
@@ -511,6 +532,7 @@ async def run(
                 jobs=jobs,
                 session=session,
                 system_prompt=system_prompt,
+                display=display,
             )
             return
 
@@ -537,6 +559,7 @@ async def run(
                 session=session,
                 system_prompt=system_prompt,
                 interactive=interactive,
+                display=display,
             )
     finally:
         try:
@@ -565,6 +588,7 @@ def main() -> None:
                 args.tool_output_limit_kib,
                 args.session_dir,
                 args.resume,
+                args.verbose,
             )
         )
     except KeyboardInterrupt:

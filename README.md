@@ -60,6 +60,16 @@ lazarus --tool-output-limit-kib 64
 
 Quit an interactive session with `/quit`.
 
+Tool calls show short status lines by default. Use `--verbose` to see full
+Python code and tool output; full results always reach the model and remain in
+the session journal and job logs.
+
+Interactive replies show the latest context size separately from cumulative
+session input/output tokens, including cached input. Context is the last model
+call's reported input plus output, not the sum across calls. Usage totals cover
+the current process run (they restart on resume). One-shot and piped runs keep
+machine-readable `LAZARUS_TOKEN_USAGE` records, including the `context` field.
+
 ## Providers
 
 Lazarus uses `kosong` and supports Kimi, OpenAI Responses, Codex subscription
@@ -103,11 +113,22 @@ You can also place skill folders in these directories manually. Each skill has a
 `SKILL.md` with instructions and may include scripts and references. Install any
 CLI tools or dependencies and configure API keys required by the skill.
 
-For tasks needing current information or external tools, the prompt instructs
-Lazarus to check these folders before choosing an approach. It reads relevant
-skill instructions and can creatively combine their tools and helpers, or use
-Python directly if none fit. Discovery is model-driven; no skill catalog is
-added to the prompt.
+At session start, Lazarus scans the global folder and project `.agents/skills/`
+folders from the working directory up to the Git root (or filesystem root
+outside a repository). A compact index of names, descriptions, and paths goes
+into the prompt. Full instructions stay on disk until the model needs them;
+it reads them through Python and can combine the skill's scripts and tools.
+
+Each `SKILL.md` needs YAML frontmatter with `name` and `description`.
+Symlinked skill folders work. The nearest project definition wins over parent
+and global definitions with the same name. Invalid skills and name conflicts
+produce startup warnings. `disable-model-invocation: true` hides a skill from
+the index. Discovery and catalog sizes are bounded, with warnings for omissions.
+
+The index stays fixed across turns and context resets to preserve the cached
+prefix. Start a new session after installing or changing skill metadata;
+`--resume` keeps the original session's index. Skill choice and execution remain
+model-driven.
 
 ## Execution model
 

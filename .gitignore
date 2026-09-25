@@ -15,4 +15,6 @@ env.sh
 .DS_Store
 
 # Local tests
-/tests/
+/tests/*
+!/tests/test_skills.py
+!/tests/test_display.py
