@@ -2,6 +2,8 @@ import argparse
 import asyncio
 import json
 import os
+from pathlib import Path
+import sys
 from dataclasses import dataclass
 from typing import cast
 
@@ -315,7 +317,14 @@ def _result_text(value: ToolReturnValue) -> str:
     return "\n".join(parts).rstrip() or "(no output)"
 
 
-def _print_token_usage(totals: TokenTotals) -> None:
+def _print_token_usage(totals: TokenTotals, *, interactive: bool = False) -> None:
+    if interactive:
+        if totals.total:
+            print(
+                f"\nSession tokens · {totals.input:,} in · {totals.output:,} out"
+                f" · {totals.total:,} total"
+            )
+        return
     print(f"{TOKEN_USAGE_PREFIX}{json.dumps(totals.as_dict(), separators=(',', ':'))}")
 
 
@@ -336,6 +345,7 @@ async def run_request(
     session: Session | None = None,
     system_prompt: str | None = None,
     continuation: bool = False,
+    interactive: bool = False,
 ) -> list[Message]:
     def append(message: Message) -> None:
         if session:
@@ -369,10 +379,12 @@ async def run_request(
             system_prompt=system_prompt,
         )
         token_totals.add(step.usage)
-        _print_token_usage(token_totals)
+        if not interactive:
+            _print_token_usage(token_totals)
         append(step.message)
         if text := step.message.extract_text():
-            print(f"\n[assistant]\n{text}")
+            label = "Lazarus:" if interactive else "[assistant]"
+            print(f"\n{label}\n{text}")
         results = await step.tool_results()
         for result in results:
             append(_tool_message(result))
@@ -411,6 +423,8 @@ async def run_request(
                 await asyncio.shield(active.task)
             if append_completions():
                 continue
+            if interactive:
+                _print_token_usage(token_totals, interactive=True)
             return history
 
 
@@ -443,9 +457,17 @@ async def run(
     history: list[Message] = []
     token_totals = TokenTotals()
     system_prompt = _system_prompt(runtime.initial_cwd)
+    interactive = prompt is None and sys.stdin.isatty() and sys.stdout.isatty()
 
     print(f"Lazarus · {chat.name} · {chat.model_name}")
-    print(f"Session: {session.directory}")
+    session_path = str(session.directory)
+    if interactive:
+        home = Path.home().resolve()
+        if session.directory.is_relative_to(home):
+            session_path = str(Path("~") / session.directory.relative_to(home))
+    print(f"Session: {session_path}")
+    if interactive:
+        print("Type /quit to exit.")
     try:
         if resume:
             history, task, system_prompt, cwd = session.restore()
@@ -464,6 +486,7 @@ async def run(
                     session=session,
                     system_prompt=system_prompt,
                     continuation=True,
+                    interactive=interactive,
                 )
         else:
             session.record("session", system_prompt=system_prompt, cwd=runtime.cwd)
@@ -484,9 +507,13 @@ async def run(
 
         while True:
             try:
-                user_input = input("\n> ")
+                user_input = input("\nYou: " if interactive else "\n> ")
             except EOFError:
+                if interactive:
+                    print()
                 break
+            if not user_input.strip():
+                continue
             if user_input.strip() == "/quit":
                 break
             history = await run_request(
@@ -500,6 +527,7 @@ async def run(
                 jobs=jobs,
                 session=session,
                 system_prompt=system_prompt,
+                interactive=interactive,
             )
     finally:
         try:

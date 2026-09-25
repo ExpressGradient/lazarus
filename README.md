@@ -160,9 +160,13 @@ recovery. A session lock prevents two agents from resuming the same journal.
 
 ## Context and token usage
 
-After every model response, Lazarus prints a `LAZARUS_TOKEN_USAGE` JSON record
-with cumulative input, cache-read, cache-creation, output, total, and successful
-loop-reset counts. This makes long agent runs measurable without changing the
+Interactive terminal sessions use `You:` and `Lazarus:` labels and show one
+compact session-token summary after each completed reply. Empty input is ignored.
+
+With `--prompt` or redirected input/output, each model response still produces a
+`LAZARUS_TOKEN_USAGE` JSON record with cumulative input, cache-read, cache-creation,
+output, total, and successful loop-reset counts. This makes long agent runs
+measurable without changing the
 model conversation. Reset counts remain telemetry and are not added to the
 system prompt.
 
