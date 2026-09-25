@@ -2,9 +2,6 @@ import argparse
 import asyncio
 import json
 import os
-import signal
-import sys
-import tempfile
 from dataclasses import dataclass
 from typing import cast
 
@@ -13,24 +10,51 @@ from kosong.chat_provider import ChatProvider, ThinkingEffort, TokenUsage
 from kosong.message import Message, ToolCall
 from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolResult, ToolReturnValue
 from kosong.tooling.simple import SimpleToolset
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
+
+from lazarus.jobs import Jobs
+from lazarus.session import Session
+from lazarus.runtime import (
+    DEFAULT_CELL_TIMEOUT,
+    DEFAULT_TOOL_OUTPUT_LIMIT_KIB,
+    PythonRuntime,
+)
 
 
-SYSTEM_PROMPT = """You are Lazarus, a coding agent working in {cwd}.
+SYSTEM_PROMPT = """You are Lazarus, a coding agent starting in {cwd}.
 
-You have two tools:
+You have three tools:
 
 `python` runs an IPython cell in one long-lived interpreter. Names, imports,
 functions, objects, and IPython state survive every tool call and every new
-loop. Use it for all computer work: inspect and edit files, run shell commands,
-run tests, and keep useful state. It is your persistent workspace, so consider
-building your own helpers and functions when they would make repeated work
-easier. Calls time out after 300 seconds by default; set `timeout` when needed.
-Print only what you need to see.
+loop. It returns a job handle immediately by default; use `yield_after` to wait
+briefly for a result. `timeout` is a separate execution deadline (300 seconds
+by default). One cell runs at a time; a busy interpreter rejects new cells.
+
+`job` observes execution outside the interpreter. Pass `id` to read new output,
+`wait` to wait up to 60 seconds, or `cancel=true` to request interruption.
+Omit `id` to list retained jobs. Reads never rerun code. Output has a byte
+cursor; pass `cursor` to reread from a specific offset. Completion is reported
+once between turns. If there is nothing useful to do, wait instead of polling.
+Cancellation and timeouts may leave partial effects; inspect before retrying.
+
+Python is your workspace and your tool-building language. Compose operations,
+wrap awkward APIs, build small helpers, batch independent work, cache expensive
+results, and inspect data programmatically. Use libraries, shell commands,
+threads, and subprocesses creatively. Build abstractions when they save work.
+Keep large objects in memory; print only evidence needed for the next decision.
+For overlap, launch subprocesses from a short cell with explicit log files and
+retain their handles. Background threads share globals and output with later
+cells; prefer subprocesses for independent work. An asyncio task alone is not
+a durable background job: the interpreter's event loop may stop between cells.
+Wait for required work and check its result before claiming success. Track and
+clean up processes you launch. Session exit stops the interpreter and its process
+group, including servers; do not promise they will survive exit.
 
 `start_new_loop` runs one last IPython cell and then replaces the earlier chat
 history with that call and its result. You decide when a fresh context would
-help.
+help. It waits for its own cell to finish and requires the interpreter to be
+idle. Jobs and logs survive context resets. Use `job` to recover their handles.
 
 The `start_new_loop` cell is a free-form handoff to your next loop. There is no
 required structure. Use normal Python: comments, variables, functions, cached
@@ -57,9 +81,6 @@ PYTHON_TOOL = "python"
 NEW_LOOP_TOOL = "start_new_loop"
 TOKEN_USAGE_PREFIX = "LAZARUS_TOKEN_USAGE "
 DEFAULT_LOOP_TOKEN_LIMIT = 150_000
-DEFAULT_CELL_TIMEOUT = 300.0
-CELL_INTERRUPT_GRACE = 10.0
-DEFAULT_TOOL_OUTPUT_LIMIT_KIB = 48
 
 
 @dataclass
@@ -131,6 +152,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum tool output kept in context (default: 48 KiB).",
     )
     parser.add_argument("--prompt", help="Run one request and exit.")
+    sessions = parser.add_mutually_exclusive_group()
+    sessions.add_argument(
+        "--session-dir", help="New session directory for the journal and job logs."
+    )
+    sessions.add_argument(
+        "--resume",
+        metavar="DIR",
+        help="Resume a session with a fresh interpreter; never replay cells.",
+    )
     return parser
 
 
@@ -188,218 +218,64 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
 
 
 class CellParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     code: str
-    timeout: float = DEFAULT_CELL_TIMEOUT
+    timeout: float = Field(default=DEFAULT_CELL_TIMEOUT, gt=0, allow_inf_nan=False)
+    yield_after: float = Field(default=0, ge=0, le=60, allow_inf_nan=False)
 
 
-class PythonRuntime:
-    def __init__(
-        self, tool_output_limit_kib: int = DEFAULT_TOOL_OUTPUT_LIMIT_KIB
-    ) -> None:
-        if tool_output_limit_kib <= 0:
-            raise ValueError("tool output limit must be positive")
-        self._process: asyncio.subprocess.Process | None = None
-        self._reader: asyncio.StreamReader | None = None
-        self._reader_transport: asyncio.ReadTransport | None = None
-        self._lock = asyncio.Lock()
-        self._tool_output_limit_bytes = tool_output_limit_kib * 1024
-        self._tool_output_dir = tempfile.TemporaryDirectory(
-            prefix="lazarus-tool-output-"
+class JobParams(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str | None = None
+    wait: float = Field(default=0, ge=0, le=60, allow_inf_nan=False)
+    cancel: bool = False
+    cursor: int | None = Field(default=None, ge=0)
+
+
+class JobTool(CallableTool2[JobParams]):
+    params = JobParams
+
+    def __init__(self, jobs: Jobs) -> None:
+        super().__init__(
+            name="job",
+            description="Read, wait for, or cancel a Python job without blocking the interpreter. Omit id to list jobs.",
         )
-        self.cwd = os.getcwd()
+        self.jobs = jobs
 
-    async def run(
-        self,
-        code: str,
-        display_name: str | None = None,
-        timeout: float = DEFAULT_CELL_TIMEOUT,
-    ) -> ToolReturnValue:
-        async with self._lock:
-            if display_name is not None:
-                _print_cell(display_name, code)
-            try:
-                result = await asyncio.wait_for(self._run_locked(code), timeout)
-            except TimeoutError:
-                result = await self._interrupt_timed_out_cell(timeout)
-            if display_name is not None:
-                _print_result(result)
-            return result
-
-    async def _run_locked(self, code: str) -> ToolReturnValue:
-        try:
-            await self._ensure_worker()
-            assert self._process is not None
-            assert self._process.stdin is not None
-            assert self._reader is not None
-
-            request = json.dumps({"code": code}, ensure_ascii=False) + "\n"
-            self._process.stdin.write(request.encode())
-            await self._process.stdin.drain()
-            raw_response = await self._reader.readline()
-            if not raw_response:
-                await self._forget_worker()
+    async def __call__(self, params: JobParams) -> ToolReturnValue:
+        if params.id is None:
+            if params.cancel or params.wait or params.cursor is not None:
                 return ToolError(
-                    message="The IPython worker exited; its in-memory state was lost.",
-                    output="",
-                    brief="Worker exited",
+                    message="id is required for wait, cancel, or cursor.",
+                    brief="Missing job ID",
                 )
-            response = json.loads(raw_response)
-        except (BrokenPipeError, ConnectionResetError, json.JSONDecodeError) as exc:
-            await self._forget_worker()
-            return ToolError(
-                message=f"The IPython worker protocol failed: {exc}",
-                output="",
-                brief="Worker failed",
-            )
-
-        if isinstance(response.get("cwd"), str):
-            self.cwd = response["cwd"]
-        output = _cell_output(response)
-        if response.get("ok"):
-            return ToolOk(output=output or "(no output)")
-        return ToolError(
-            message=str(response.get("error", "IPython cell failed")),
-            output=output,
-            brief="Cell failed",
+            return ToolOk(output=self.jobs.listing())
+        result = await self.jobs.inspect(
+            params.id, wait=params.wait, cancel=params.cancel, cursor=params.cursor
         )
-
-    async def _interrupt_timed_out_cell(self, timeout: float) -> ToolReturnValue:
-        process = self._process
-        reader = self._reader
-        if process is not None and process.returncode is None and reader is not None:
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGINT)
-                else:
-                    process.send_signal(signal.SIGINT)
-                raw_response = await asyncio.wait_for(
-                    reader.readline(), CELL_INTERRUPT_GRACE
-                )
-                if raw_response:
-                    response = json.loads(raw_response)
-                    if isinstance(response.get("cwd"), str):
-                        self.cwd = response["cwd"]
-                    return ToolError(
-                        message=(
-                            f"Cell exceeded the {timeout:g}s timeout and was interrupted; "
-                            "interpreter state was preserved."
-                        ),
-                        output=_cell_output(response),
-                        brief="Cell timed out",
-                    )
-            except (
-                OSError,
-                TimeoutError,
-                ConnectionResetError,
-                ValueError,
-                json.JSONDecodeError,
-            ):
-                pass
-
-        await self._forget_worker()
-        return ToolError(
-            message=f"Cell exceeded the {timeout:g}s timeout; interpreter state was lost.",
-            output="",
-            brief="Cell timed out",
-        )
-
-    async def _ensure_worker(self) -> None:
-        if self._process is not None and self._process.returncode is None:
-            return
-
-        await self._forget_worker()
-        read_fd, write_fd = os.pipe()
-        self._process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-u",
-            "-m",
-            "lazarus.python_worker",
-            str(write_fd),
-            str(self._tool_output_limit_bytes),
-            self._tool_output_dir.name,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            pass_fds=(write_fd,),
-            start_new_session=os.name == "posix",
-        )
-        os.close(write_fd)
-
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        loop = asyncio.get_running_loop()
-        transport, _ = await loop.connect_read_pipe(
-            lambda: protocol,
-            os.fdopen(read_fd, "rb", buffering=0),
-        )
-        self._reader = reader
-        self._reader_transport = transport
-
-    async def _forget_worker(self) -> None:
-        if self._reader_transport is not None:
-            self._reader_transport.close()
-        self._reader = None
-        self._reader_transport = None
-
-        process = self._process
-        self._process = None
-        if process is None:
-            return
-        if process.stdin is not None:
-            process.stdin.close()
-        if process.returncode is None:
-            try:
-                await asyncio.wait_for(process.wait(), timeout=0.5)
-            except TimeoutError:
-                self._signal_worker(process, force=False)
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=0.5)
-                except TimeoutError:
-                    self._signal_worker(process, force=True)
-                    await process.wait()
-        if os.name == "posix":
-            self._signal_worker(process, force=True)
-
-    @staticmethod
-    def _signal_worker(process: asyncio.subprocess.Process, *, force: bool) -> None:
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        elif force:
-            process.kill()
-        else:
-            process.terminate()
-
-    async def close(self) -> None:
-        async with self._lock:
-            await self._forget_worker()
-            self._tool_output_dir.cleanup()
+        _print_result(result)
+        return result
 
 
 class CellTool(CallableTool2[CellParams]):
     params = CellParams
 
-    def __init__(self, runtime: PythonRuntime, name: str, description: str) -> None:
+    def __init__(self, jobs: Jobs, name: str, description: str) -> None:
         super().__init__(name=name, description=description)
-        self.runtime = runtime
+        self.jobs = jobs
 
     async def __call__(self, params: CellParams) -> ToolReturnValue:
-        return await self.runtime.run(params.code, self.name, params.timeout)
-
-
-def _cell_output(response: dict[str, object]) -> str:
-    parts = []
-    if stdout := response.get("stdout"):
-        parts.append(str(stdout).rstrip())
-    if stderr := response.get("stderr"):
-        parts.append(f"[stderr]\n{str(stderr).rstrip()}")
-    if output_path := response.get("output_path"):
-        parts.append(
-            f"[full output: {output_path}; inspect targeted sections only]"
-        )
-    return "\n".join(parts)
+        _print_cell(self.name, params.code)
+        if self.name == PYTHON_TOOL:
+            result = await self.jobs.submit(
+                params.code, params.timeout, params.yield_after
+            )
+        else:
+            result = await self.jobs.submit(
+                params.code, params.timeout, 0, wait_completion=True
+            )
+        _print_result(result)
+        return result
 
 
 def _tool_message(result: ToolResult) -> Message:
@@ -455,30 +331,62 @@ async def run_request(
     user_input: str,
     token_totals: TokenTotals,
     loop_token_limit: int,
+    *,
+    jobs: Jobs | None = None,
+    session: Session | None = None,
+    system_prompt: str | None = None,
+    continuation: bool = False,
 ) -> list[Message]:
-    history.append(Message(role="user", content=user_input))
+    def append(message: Message) -> None:
+        if session:
+            session.message(message)
+        history.append(message)
+
+    def append_completions() -> bool:
+        notices = jobs.notifications() if jobs else []
+        if notices:
+            append(
+                Message(role="user", content="[Job completion]\n" + "\n".join(notices))
+            )
+            print("\n[job completion]\n" + "\n".join(notices))
+        return bool(notices)
+
+    if not continuation:
+        if session:
+            session.record("request", task=user_input)
+        append(Message(role="user", content=user_input))
+    # cwd changes are reported in job results, never in the cached prefix.
+    system_prompt = system_prompt or _system_prompt(
+        getattr(runtime, "initial_cwd", runtime.cwd)
+    )
 
     while True:
+        append_completions()
         step = await kosong.step(
             chat_provider=chat,
             toolset=toolset,
             history=history,
-            system_prompt=_system_prompt(runtime.cwd),
+            system_prompt=system_prompt,
         )
         token_totals.add(step.usage)
         _print_token_usage(token_totals)
-        history.append(step.message)
+        append(step.message)
         if text := step.message.extract_text():
             print(f"\n[assistant]\n{text}")
         results = await step.tool_results()
-        result_messages = [_tool_message(result) for result in results]
-        history.extend(result_messages)
+        for result in results:
+            append(_tool_message(result))
 
         if new_history := _new_loop_history(user_input, step.tool_calls, results):
             token_totals.loops_started += 1
             token_totals.loop_context_tokens = 0
             token_totals.loop_steer_sent = False
             history = new_history
+            if session:
+                session.record(
+                    "reset",
+                    history=[message.model_dump(mode="json") for message in history],
+                )
             print("\n[new loop]\nPrevious chat history was replaced.")
             continue
 
@@ -492,11 +400,17 @@ async def run_request(
                 "tokens. Compact the useful state into a concise handoff and call "
                 "`start_new_loop` now."
             )
-            history.append(Message(role="user", content=steer_message))
+            append(Message(role="user", content=steer_message))
             token_totals.loop_steer_sent = True
             print(f"\n[steer]\n{steer_message}")
 
         if not results:
+            if jobs and (active := jobs.active) and active.task is not None:
+                print(f"\n[waiting for job {active.id}]")
+                # No model polling loop when it has no independent work left.
+                await asyncio.shield(active.task)
+            if append_completions():
+                continue
             return history
 
 
@@ -505,27 +419,54 @@ async def run(
     prompt: str | None,
     loop_token_limit: int,
     tool_output_limit_kib: int,
+    session_dir: str | None = None,
+    resume: str | None = None,
 ) -> None:
+    session = Session(resume or session_dir, resume=resume is not None)
     runtime = PythonRuntime(tool_output_limit_kib)
+    jobs = Jobs(runtime, session.directory / "jobs", session.record)
     toolset = SimpleToolset(
         [
             CellTool(
-                runtime,
+                jobs,
                 PYTHON_TOOL,
-                "Run a persistent IPython cell. State survives calls and new loops.",
+                "Run a persistent IPython cell. Returns a job immediately; yield_after waits briefly. State survives calls and new loops.",
             ),
             CellTool(
-                runtime,
+                jobs,
                 NEW_LOOP_TOOL,
                 "Run a free-form handoff cell, replace chat history, and continue.",
             ),
+            JobTool(jobs),
         ]
     )
     history: list[Message] = []
     token_totals = TokenTotals()
+    system_prompt = _system_prompt(runtime.initial_cwd)
 
     print(f"Lazarus · {chat.name} · {chat.model_name}")
+    print(f"Session: {session.directory}")
     try:
+        if resume:
+            history, task, system_prompt, cwd = session.restore()
+            runtime.cwd = cwd
+            runtime.initial_cwd = cwd
+            if prompt is None:
+                history = await run_request(
+                    chat,
+                    toolset,
+                    runtime,
+                    history,
+                    task,
+                    token_totals,
+                    loop_token_limit,
+                    jobs=jobs,
+                    session=session,
+                    system_prompt=system_prompt,
+                    continuation=True,
+                )
+        else:
+            session.record("session", system_prompt=system_prompt, cwd=runtime.cwd)
         if prompt is not None:
             await run_request(
                 chat,
@@ -535,6 +476,9 @@ async def run(
                 prompt,
                 token_totals,
                 loop_token_limit,
+                jobs=jobs,
+                session=session,
+                system_prompt=system_prompt,
             )
             return
 
@@ -553,9 +497,18 @@ async def run(
                 user_input,
                 token_totals,
                 loop_token_limit,
+                jobs=jobs,
+                session=session,
+                system_prompt=system_prompt,
             )
     finally:
-        await runtime.close()
+        try:
+            await jobs.close()
+        finally:
+            try:
+                await runtime.close()
+            finally:
+                session.close()
 
 
 def main() -> None:
@@ -563,6 +516,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.tool_output_limit_kib <= 0:
         parser.error("--tool-output-limit-kib must be positive")
+    if args.loop_token_limit <= 0:
+        parser.error("--loop-token-limit must be positive")
     try:
         chat = create_chat_provider(args)
         asyncio.run(
@@ -571,6 +526,8 @@ def main() -> None:
                 args.prompt,
                 args.loop_token_limit,
                 args.tool_output_limit_kib,
+                args.session_dir,
+                args.resume,
             )
         )
     except KeyboardInterrupt:

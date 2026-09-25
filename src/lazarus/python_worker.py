@@ -1,7 +1,9 @@
 import json
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import shutil
+import signal
 import sys
 import tempfile
 from typing import BinaryIO, NotRequired, TypedDict
@@ -10,7 +12,9 @@ from IPython.core.interactiveshell import InteractiveShell
 from traitlets.config import Config
 
 
-os.environ.setdefault("IPYTHONDIR", os.path.join(tempfile.gettempdir(), "lazarus-ipython"))
+os.environ.setdefault(
+    "IPYTHONDIR", os.path.join(tempfile.gettempdir(), "lazarus-ipython")
+)
 
 
 MAX_OUTPUT_BYTES = 48 * 1024
@@ -105,14 +109,25 @@ def execute_cell(
     max_output_bytes: int = MAX_OUTPUT_BYTES,
     output_dir: str | None = None,
     output_index: int = 0,
+    live_output_path: str | None = None,
 ) -> CellResult:
     base_stdout = sys.__stdout__
     base_stderr = sys.__stderr__
 
-    with (
-        tempfile.TemporaryFile(mode="w+b") as stdout_file,
-        tempfile.TemporaryFile(mode="w+b") as stderr_file,
-    ):
+    with ExitStack() as stack:
+        stdout_file = stack.enter_context(
+            open(live_output_path, "a+b")
+            if live_output_path is not None
+            else tempfile.TemporaryFile(mode="w+b")
+        )
+        # One log preserves the arrival order of stdout and stderr and is
+        # readable by the supervisor while the interpreter is busy. Append
+        # mode keeps inherited child writes safe while we seek to read output.
+        stderr_file = (
+            stdout_file
+            if live_output_path is not None
+            else stack.enter_context(tempfile.TemporaryFile(mode="w+b"))
+        )
         saved_stdout_fd = os.dup(1)
         saved_stderr_fd = os.dup(2)
         _flush(sys.stdout)
@@ -141,9 +156,13 @@ def execute_cell(
             sys.stderr = base_stderr
 
         stdout_size = stdout_file.seek(0, os.SEEK_END)
-        stderr_size = stderr_file.seek(0, os.SEEK_END)
-        output_path = None
-        if output_dir is not None and stdout_size + stderr_size > max_output_bytes:
+        stderr_size = 0 if live_output_path else stderr_file.seek(0, os.SEEK_END)
+        output_path = live_output_path
+        if (
+            not live_output_path
+            and output_dir is not None
+            and stdout_size + stderr_size > max_output_bytes
+        ):
             try:
                 output_path = _save_output(
                     stdout_file, stderr_file, output_dir, output_index
@@ -154,7 +173,7 @@ def execute_cell(
             stdout_size, stderr_size, max_output_bytes
         )
         stdout = _read_stream(stdout_file, stdout_limit)
-        stderr = _read_stream(stderr_file, stderr_limit)
+        stderr = "" if live_output_path else _read_stream(stderr_file, stderr_limit)
 
     error = infrastructure_error
     if error is None and result is not None:
@@ -196,9 +215,19 @@ def main() -> None:
         raise SystemExit("MAX_OUTPUT_BYTES must be positive")
     output_dir = sys.argv[3]
     shell = create_shell()
+    executing = False
+
+    def interrupt(signum: int, frame: object) -> None:
+        # A deadline can race with a just-written response. SIGINT must not
+        # kill an idle interpreter after the supervisor receives that response.
+        if executing:
+            raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, interrupt)
 
     for output_index, raw_line in enumerate(requests, start=1):
         try:
+            executing = True
             request = json.loads(raw_line)
             response = execute_cell(
                 shell,
@@ -206,6 +235,7 @@ def main() -> None:
                 max_output_bytes,
                 output_dir,
                 output_index,
+                request.get("output_path"),
             )
         except BaseException as exc:
             response = {
@@ -214,6 +244,8 @@ def main() -> None:
                 "stderr": "",
                 "error": f"{type(exc).__name__}: {exc}",
             }
+        finally:
+            executing = False
         responses.write(json.dumps(response, ensure_ascii=False) + "\n")
         responses.flush()
 
