@@ -2,6 +2,7 @@ import asyncio
 import json
 from contextlib import redirect_stdout
 from io import StringIO
+from importlib.metadata import version
 import os
 from pathlib import Path
 import signal
@@ -75,6 +76,16 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"B" * MAX_OUTPUT_BYTES, full_output)
         await self.runtime.close()
         self.assertTrue(saved.exists())
+
+    def test_version(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["--version"])
+
+        self.assertEqual(0, raised.exception.code)
+        self.assertEqual(
+            f"{build_parser().prog} {version('lazarus')}\n", output.getvalue()
+        )
 
     def test_tool_output_limit_is_configurable(self) -> None:
         args = build_parser().parse_args(["--tool-output-limit-kib", "64"])

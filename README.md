@@ -40,6 +40,12 @@ Run directly from a checkout:
 uv run lazarus
 ```
 
+Show the installed version:
+
+```sh
+lazarus --version
+```
+
 Run one request and exit:
 
 ```sh

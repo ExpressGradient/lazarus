@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 import sys
 from dataclasses import dataclass
+from importlib.metadata import version
 from typing import cast
 
 import kosong
@@ -126,6 +127,11 @@ class TokenTotals:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="A coding agent with persistent IPython state."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {version('lazarus')}",
     )
     parser.add_argument("--provider", choices=PROVIDERS, default="kimi")
     parser.add_argument(
