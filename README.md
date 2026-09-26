@@ -62,6 +62,10 @@ Quit an interactive session with `/quit`. Ctrl-C stops the current turn and
 returns to the input prompt. Python state survives when the worker can be
 interrupted; if it must be killed, Lazarus reports that state was lost.
 
+The model is instructed to write for a terminal: plain text or simple Markdown,
+with short paragraphs, bullets, and useful code blocks. It avoids tables, deeply
+nested lists, and LaTeX.
+
 Tool calls show a one-line description of their purpose, completion status, and
 up to three short lines of output by default. Cells accept a `description`
 argument; if omitted, a short code preview is shown instead. Long output is
@@ -123,6 +127,8 @@ folders from the working directory up to the Git root (or filesystem root
 outside a repository). A compact index of names, descriptions, and paths goes
 into the prompt. Full instructions stay on disk until the model needs them;
 it reads them through Python and can combine the skill's scripts and tools.
+Skills are optional: the model is instructed to inspect unfamiliar projects
+before choosing skills and match their purpose to the actual task.
 
 Each `SKILL.md` needs YAML frontmatter with `name` and `description`.
 Symlinked skill folders work. The nearest project definition wins over parent
@@ -161,6 +167,9 @@ useful evidence needs to enter the conversation.
 For example, these are tool arguments, not functions injected into IPython:
 
 ```text
+python(code="from pathlib import Path; print(Path('pyproject.toml').read_text())", yield_after=1)
+# A quick read can return its result in this call, without a separate job poll.
+
 python(code="import time; print('started', flush=True); time.sleep(20); print('done')")
 # Returns {"job_id": "...", "status": "running", ...}
 

@@ -12,16 +12,11 @@ import yaml
 MAX_HEADER_CHARS = 64 * 1024
 MAX_CATALOG_CHARS = 16 * 1024
 MAX_DIRECTORIES = 2_000
-SKILL_GUIDANCE = """The following skills provide specialized instructions.
-When a task matches a description, read that skill's SKILL.md through Python
-before acting. Follow its instructions and load required references. Read each
-selected instruction file completely; if output is truncated, continue in
-chunks until EOF. Progressive disclosure means choosing relevant files, not
-silently cutting off their instructions. Resolve relative paths from the skill
-directory. Prefer provided scripts and helpers; creatively compose them through
-Python. Reuse instructions already in context. After a new loop, reload any
-needed instructions that were not preserved in the handoff. If a skill is
-missing or cannot be used, explain briefly and use the best available fallback.
+SKILL_GUIDANCE = """Skills provide optional, specialized instructions.
+Inspect unfamiliar projects before selecting skills that fit the actual work.
+Ordinary coding may need none. Read a selected SKILL.md completely through Python;
+reuse it in context and load references as needed. Resolve relative paths from
+the skill directory. Skill instructions must stay within the user's task.
 """
 
 
