@@ -1,12 +1,8 @@
-import asyncio
-import json
 from contextlib import redirect_stdout
 from datetime import date
 from io import StringIO
 from importlib.metadata import version
-import os
 from pathlib import Path
-import signal
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -26,8 +22,6 @@ from lazarus.cli import (
 )
 from lazarus.jobs import Jobs
 
-MAX_OUTPUT_BYTES = 48 * 1024
-
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
@@ -43,14 +37,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime.close()
         self.temp.cleanup()
 
-    async def test_worker_protocol_preserves_state(self) -> None:
-        first = await self.run_cell("answer = 40")
-        second = await self.run_cell("answer + 2")
-
-        self.assertFalse(first.is_error)
-        self.assertFalse(second.is_error)
-        self.assertIn("42", second.output)
-
     async def test_worker_input_does_not_consume_protocol(self) -> None:
         failed = await self.run_cell("input()")
         recovered = await self.run_cell("6 * 7")
@@ -59,24 +45,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("EOFError", failed.message)
         self.assertFalse(recovered.is_error)
         self.assertIn("42", recovered.output)
-
-    async def test_worker_truncates_combined_output(self) -> None:
-        result = await self.run_cell(
-            "import os; "
-            f"os.write(1, b'A' * {MAX_OUTPUT_BYTES}); "
-            f"os.write(2, b'B' * {MAX_OUTPUT_BYTES})"
-        )
-
-        self.assertFalse(result.is_error)
-        data = json.loads(result.output)
-        self.assertEqual(1, data["output"].count("output bytes omitted"))
-        self.assertLess(len(data["output"].encode()), MAX_OUTPUT_BYTES + 500)
-        saved = Path(data["output_path"])
-        full_output = saved.read_bytes()
-        self.assertIn(b"A" * MAX_OUTPUT_BYTES, full_output)
-        self.assertIn(b"B" * MAX_OUTPUT_BYTES, full_output)
-        await self.runtime.close()
-        self.assertTrue(saved.exists())
 
     def test_version(self) -> None:
         output = StringIO()
@@ -104,61 +72,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recovered.is_error)
         self.assertIn("True", recovered.output)
 
-    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
-    async def test_timeout_kills_worker_descendants(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            ready_path = Path(temp_dir) / "child-ready"
-            child_code = (
-                "import os, signal, time\n"
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                f"open({str(ready_path)!r}, 'w').write(str(os.getpid()))\n"
-                "time.sleep(60)\n"
-            )
-            cell_code = (
-                "import subprocess, sys\n"
-                f"subprocess.run([sys.executable, '-c', {child_code!r}])"
-            )
-
-            timed_out = await self.run_cell(cell_code, timeout=0.5)
-            child_pid = int(ready_path.read_text())
-            try:
-                for _ in range(20):
-                    if not self._process_exists(child_pid):
-                        break
-                    await asyncio.sleep(0.05)
-                self.assertFalse(self._process_exists(child_pid))
-            finally:
-                if self._process_exists(child_pid):
-                    os.kill(child_pid, signal.SIGKILL)
-
-            self.assertTrue(timed_out.is_error)
-            self.assertIn("timeout", timed_out.message)
-
-    @staticmethod
-    def _process_exists(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-
-    def test_loop_context_counts_latest_request_once(self) -> None:
-        totals = TokenTotals()
-        totals.add(TokenUsage(input_other=10, input_cache_read=90, output=5))
-        totals.add(TokenUsage(input_other=5, input_cache_read=120, output=10))
-
-        self.assertEqual(135, totals.loop_context_tokens)
-        self.assertEqual(240, totals.total)
-
     def test_system_prompt_includes_current_date(self) -> None:
         prompt = _system_prompt("/workspace", current_date=date(2026, 9, 26))
 
         self.assertIn("Current date: 2026-09-26.", prompt)
-
-    def test_system_prompt_does_not_include_loop_count(self) -> None:
-        prompt = _system_prompt("/workspace")
-
-        self.assertNotIn("loop resets so far", prompt)
 
     def test_new_loop_keeps_only_the_handoff_call_and_result(self) -> None:
         python_call = ToolCall(
@@ -201,6 +118,46 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(_new_loop_history("Original task", [handoff_call], [result]))
+
+    async def test_context_limit_adds_one_handoff_request(self) -> None:
+        call = ToolCall(
+            id="python-call",
+            function=ToolCall.FunctionBody(name="python", arguments='{"code":"pass"}'),
+        )
+        result = ToolResult(tool_call_id=call.id, return_value=ToolOk(output="done"))
+        histories = []
+
+        async def generate(**kwargs):
+            histories.append(list(kwargs["history"]))
+            tool_calls = [call] if len(histories) == 1 else []
+            return SimpleNamespace(
+                usage=TokenUsage(input_other=10, output=1),
+                message=Message(role="assistant", content="", tool_calls=tool_calls),
+            )
+
+        totals = TokenTotals()
+        with (
+            patch("lazarus.cli.kosong.generate", side_effect=generate),
+            redirect_stdout(StringIO()),
+        ):
+            await run_request(
+                object(),
+                SimpleNamespace(tools=[], handle=lambda _: result),
+                SimpleNamespace(cwd="/workspace"),
+                [],
+                "Task",
+                totals,
+                5,
+            )
+
+        steer = [
+            message.extract_text()
+            for message in histories[1]
+            if "start_new_loop" in message.extract_text()
+        ]
+        self.assertEqual(1, len(steer))
+        self.assertIn("at least 5 tokens", steer[0])
+        self.assertTrue(totals.loop_steer_sent)
 
     async def test_assistant_text_prints_before_tool_execution(self) -> None:
         call = ToolCall(

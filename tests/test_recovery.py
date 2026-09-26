@@ -188,6 +188,15 @@ class DispatchTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JournalTests(unittest.TestCase):
+    def test_session_lock_prevents_concurrent_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            session = Session(directory)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    Session(directory, resume=True)
+            finally:
+                session.close()
+
     def test_large_journal_streams_resets_and_preserves_latest_cwd(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "journal.jsonl"

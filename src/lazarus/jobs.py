@@ -152,7 +152,10 @@ class Jobs:
             await asyncio.wait({job.task}, timeout=wait)
         if job.task is not None and job.task.done():
             job.task.result()  # Surface journal failures instead of hiding them.
-        data = self.snapshot(job, cursor)
+        try:
+            data = self.snapshot(job, cursor)
+        except ValueError as exc:
+            return ToolError(message=str(exc), brief="Invalid cursor")
         if job.status != "running":
             job.notified = True
         output = json.dumps(data, ensure_ascii=False)

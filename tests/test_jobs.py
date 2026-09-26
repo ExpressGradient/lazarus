@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import signal
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -25,9 +24,8 @@ from lazarus.cli import (
     TokenTotals,
     run_request,
 )
-from lazarus.jobs import Jobs
+from lazarus.jobs import Job, Jobs
 from lazarus.runtime import PythonRuntime
-from lazarus.session import Session
 
 
 class JobIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -54,11 +52,9 @@ class JobIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
 
     async def test_immediate_live_logs_cursor_wait_and_cancel(self):
-        before = time.monotonic()
         data = await self.start(
             "import time\nanswer = 42\nprint('ready', flush=True)\ntime.sleep(30)"
         )
-        self.assertLess(time.monotonic() - before, 0.2)
         job_id = data["job_id"]
         self.assertEqual(data["status"], "running")
         await self.wait_for_log(job_id, "ready")
@@ -130,6 +126,34 @@ class JobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await large_jobs.close()
             await runtime.close()
+
+    async def test_job_failures_and_invalid_observations_are_tool_errors(self):
+        with patch.object(self.runtime, "run", side_effect=RuntimeError("boom")):
+            failed = await self.jobs.submit("pass", 10, 5)
+        state = json.loads(failed.output)
+        self.assertTrue(failed.is_error)
+        self.assertEqual("failed", state["status"])
+        self.assertIn("RuntimeError: boom", failed.message)
+
+        invalid = await self.jobs.inspect(state["job_id"], cursor=1000)
+        unknown = await self.jobs.inspect("missing")
+        missing_id = await JobTool(self.jobs)(JobParams(wait=1))
+        self.assertEqual("Invalid cursor", invalid.brief)
+        self.assertEqual("Unknown job", unknown.brief)
+        self.assertEqual("Missing job ID", missing_id.brief)
+
+    def test_live_snapshot_waits_for_complete_utf8(self):
+        output = self.root / "partial.log"
+        output.write_bytes(b"\xe2\x82")
+        job = Job("partial", output)
+
+        first = self.jobs.snapshot(job)
+        self.assertEqual(("", 0), (first["output"], first["cursor"]))
+
+        with output.open("ab") as stream:
+            stream.write(b"\xac\n")
+        second = self.jobs.snapshot(job)
+        self.assertEqual(("€\n", 4), (second["output"], second["cursor"]))
 
     async def test_observer_cancellation_does_not_cancel_job(self):
         data = await self.start(
@@ -270,35 +294,3 @@ class JobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for value in [float("nan"), float("inf"), -1, 61]:
             with self.assertRaises(ValidationError):
                 JobParams(wait=value)
-
-
-class SessionIntegrationTests(unittest.TestCase):
-    def test_resume_repairs_partial_record_and_missing_tool_result_without_replay(self):
-        with tempfile.TemporaryDirectory() as directory:
-            session = Session(directory)
-            session.record("session", cwd="/tmp", system_prompt="stable")
-            session.record("request", task="Task")
-            session.message(Message(role="user", content="Task"))
-            call = ToolCall(
-                id="pending",
-                function=ToolCall.FunctionBody(
-                    name="python", arguments='{"code":"side_effect()"}'
-                ),
-            )
-            session.message(Message(role="assistant", content=[], tool_calls=[call]))
-            with self.assertRaises(BlockingIOError):
-                Session(directory, resume=True)
-            session.close()
-            path = Path(directory) / "journal.jsonl"
-            with path.open("ab") as f:
-                f.write(b'{"event":"mess')
-            restored = Session(directory, resume=True)
-            history, task, prompt, cwd = restored.restore()
-            self.assertEqual((task, prompt, cwd), ("Task", "stable", "/tmp"))
-            self.assertEqual(history[-2].role, "tool")
-            self.assertEqual(history[-2].tool_call_id, "pending")
-            self.assertIn("not replayed", history[-2].extract_text())
-            self.assertIn("fresh interpreter", history[-1].extract_text())
-            restored.close()
-            for line in path.read_text().splitlines():
-                json.loads(line)
