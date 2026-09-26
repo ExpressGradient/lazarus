@@ -1,273 +1,203 @@
 # Lazarus
 
-Lazarus is a small coding agent built around one idea: an IPython interpreter
-can be both the agent's computer and its memory.
+Lazarus is a small coding agent whose computer and working memory are the same
+long-lived IPython interpreter. It can inspect a repository, edit files, run
+commands, keep useful Python objects between steps, and compact long conversations
+without throwing away interpreter state.
 
-The model has three tools:
+## Quick start
 
-- `python` starts a cell in a long-lived IPython process and returns a job handle
-  immediately. Set `yield_after` (0–60 seconds) to wait briefly for its result.
-- `job` reads progress, waits, or requests cancellation outside the interpreter.
-- `start_new_loop` runs a final handoff cell, discards earlier chat history,
-  and continues with the same IPython process. It requires an idle interpreter
-  and waits for its own cell to finish.
-
-Both cell tools default to a 300-second execution deadline, configurable with
-`timeout`. Yielding or ending a status wait does **not** cancel execution.
-Cancellation and deadlines first interrupt the worker's process group. Surviving
-children in that group are killed. Interpreter state survives if recovery and
-child cleanup succeed; otherwise the group is stopped and a fresh worker starts
-on the next call. Partial file writes and other side effects are never rolled back.
-
-The model decides when to start a new loop. Lazarus also steers it toward a
-handoff when the current context reaches 150,000 tokens. The handoff cell is
-ordinary, free-form Python. It can preserve notes, functions, objects, relevant
-file slices, commands, and anything else the next loop needs. There is no
-checkpoint schema or helper API.
-
-## Install
-
-Lazarus requires Python 3.12+ and `uv`.
+Requires Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
 
 ```sh
 uv tool install git+https://github.com/ExpressGradient/lazarus
+cd your-project
 lazarus
 ```
 
-Run directly from a checkout:
+Run from a checkout with `uv run lazarus`. In an interactive session, use `/quit`
+to exit and Ctrl-C to stop the current turn without exiting Lazarus.
+
+### Common workflows
 
 ```sh
-uv run lazarus
+# Complete one task and exit
+lazarus --prompt "find the failing tests, fix the cause, and verify the fix"
+
+# Use Codex through an existing ChatGPT login
+codex login
+lazarus --provider codex --thinking-effort high
+
+# Pin a provider and model
+lazarus --provider anthropic --model claude-opus-5
+
+# Keep the journal and logs at a known location, then resume later
+lazarus --session-dir ./.lazarus-session
+lazarus --resume ./.lazarus-session
+
+# Show complete tool calls and output in the terminal
+lazarus --verbose
+
+# Give a large task more context and retain more tool output
+lazarus --loop-token-limit 250000 --tool-output-limit-kib 64
 ```
 
-Show the installed version:
+`--prompt` is useful in scripts: normal replies go to stdout and each model call
+emits a machine-readable `LAZARUS_TOKEN_USAGE {...}` line. Interactive mode shows
+a compact context and cumulative token summary instead.
 
-```sh
-lazarus --version
+Good prompts give the agent an outcome and verification target, not a sequence of
+shell commands. For example:
+
+```text
+Trace why the API test is flaky, make the smallest safe fix, and run the relevant tests.
+Review this branch against main for correctness issues. Do not edit files.
+Upgrade the dependency, update affected code, and summarize any behavior changes.
 ```
-
-Run one request and exit:
-
-```sh
-lazarus --prompt "fix the failing tests"
-```
-
-Set a different context-loop threshold, for example 250,000 tokens:
-
-```sh
-lazarus --loop-token-limit 250000
-```
-
-Change the maximum tool output kept in context, for example to 64 KiB:
-
-```sh
-lazarus --tool-output-limit-kib 64
-```
-
-Quit an interactive session with `/quit`. Ctrl-C stops the current turn and
-returns to the input prompt. Python state survives when the worker can be
-interrupted; if it must be killed, Lazarus reports that state was lost.
-
-The model is instructed to write for a terminal: plain text or simple Markdown,
-with short paragraphs, bullets, and useful code blocks. It avoids tables, deeply
-nested lists, and LaTeX.
-
-Tool calls show a one-line description of their purpose, completion status, and
-up to three short lines of output by default. Cells accept a `description`
-argument; if omitted, a short code preview is shown instead. Long output is
-marked with `…`. Use `--verbose` to see full Python code and returned tool output.
-Terminal previews do not shorten model results, which use the configured output
-limit. Complete output stays in job logs.
-
-Interactive replies show the latest context size separately from cumulative
-session input/output tokens, including cached input. Context is the last model
-call's reported input plus output, not the sum across calls. Usage totals cover
-the current process run (they restart on resume). One-shot and piped runs keep
-machine-readable `LAZARUS_TOKEN_USAGE` records, including the `context` field.
 
 ## Providers
 
-Lazarus uses `kosong` and supports Kimi, OpenAI Responses, Codex subscription
-usage, Anthropic, Google, and generic OpenAI-compatible Chat Completions APIs.
-The named providers have default models; `openai-legacy` requires an explicit
-model ID.
+The default provider is Kimi. Lazarus uses `kosong` and supports:
 
 ```sh
-lazarus --provider kimi       # kimi-k3
-lazarus --provider codex      # gpt-5.6-sol, uses `codex login`
-lazarus --provider openai     # gpt-5.6-sol
-lazarus --provider anthropic  # claude-opus-5
-lazarus --provider google     # gemini-3.7-flash
+lazarus --provider kimi       # default: kimi-k3
+lazarus --provider codex      # default: gpt-5.6-sol; requires `codex login`
+lazarus --provider openai     # default: gpt-5.6-sol
+lazarus --provider anthropic  # default: claude-opus-5
+lazarus --provider google     # default: gemini-3.7-flash
 lazarus --provider openai-legacy --model your-model
 ```
 
-Set the credentials expected by the chosen provider before running Lazarus.
-For `codex`, run `codex login`; usage counts against that ChatGPT subscription.
-For `openai-legacy`, set `OPENAI_API_KEY`. Set `OPENAI_BASE_URL` for a compatible
-server; if omitted, it uses OpenAI's default endpoint. APIs that return thinking
-in an extra message field can set `OPENAI_REASONING_KEY`, such as
-`reasoning_content`.
+Set the credentials required by the selected provider. `openai-legacy` requires
+`OPENAI_API_KEY`; `OPENAI_BASE_URL` can point it at an OpenAI-compatible server.
+For servers that return reasoning in a separate field, set
+`OPENAI_REASONING_KEY` (for example, `reasoning_content`). Use `--model` to
+override any provider default and `--thinking-effort` to select `off`, `low`,
+`medium`, `high`, `xhigh`, or `max` where supported.
 
-## Skills
+## What the agent can do
 
-Lazarus can discover skills installed with the Skills CLI's `--agent universal`
-option:
+The model receives three tools:
 
-```sh
-# Install for the current project (.agents/skills/)
-bunx skills add <repo-or-path> --agent universal
+- `python` runs code in a persistent IPython worker. Imports, variables, functions,
+  and objects survive between calls and context resets.
+- `job` reads progress, waits, rereads output from a byte offset, or cancels the
+  active cell without blocking the host process.
+- `start_new_loop` runs a final handoff cell and replaces old chat history while
+  preserving the worker, jobs, logs, and system prompt.
 
-# Install globally (~/.agents/skills/)
-bunx skills add <repo-or-path> --agent universal --global
+A quick cell can wait up to 60 seconds with `yield_after`; otherwise it immediately
+returns a job handle. This is yielding, not cancellation. Cells have a 300-second
+default deadline, and only one cell can execute at a time.
 
-# Example: Vercel's browser automation skill
-bunx skills add vercel-labs/agent-browser --agent universal
-```
-
-You can also place skill folders in these directories manually. Each skill has a
-`SKILL.md` with instructions and may include scripts and references. Install any
-CLI tools or dependencies and configure API keys required by the skill.
-
-At session start, Lazarus scans the global folder and project `.agents/skills/`
-folders from the working directory up to the Git root (or filesystem root
-outside a repository). A compact index of names, descriptions, and paths goes
-into the prompt. Full instructions stay on disk until the model needs them;
-it reads them through Python and can combine the skill's scripts and tools.
-Skills are optional: the model is instructed to inspect unfamiliar projects
-before choosing skills and match their purpose to the actual task.
-
-Each `SKILL.md` needs YAML frontmatter with `name` and `description`.
-Symlinked skill folders work. The nearest project definition wins over parent
-and global definitions with the same name. Invalid skills and name conflicts
-produce startup warnings. `disable-model-invocation: true` hides a skill from
-the index. Discovery and catalog sizes are bounded, with warnings for omissions.
-
-The index stays fixed across turns and context resets to preserve the cached
-prefix. Start a new session after installing or changing skill metadata;
-`--resume` keeps the original session's index. Skill choice and execution remain
-model-driven.
-
-## Execution model
-
-IPython runs in a child process. Requests and result metadata use a private JSON
-channel; output goes directly to one live job log, which the host reads and
-truncates for context. Python and subprocess output cannot corrupt the protocol. Standard input is
-detached from that channel. Names, functions, imports, and objects survive calls
-and context resets, until the worker or session exits.
-
-The complete assistant response is journaled before any tool call executes.
-A dropped model stream cannot dispatch a partial response. Interrupted calls
-are marked as uncertain and are never automatically replayed.
-
-One cell runs at a time. A second cell or handoff receives a busy error without
-executing. Job observation stays responsive because it runs in the host process.
-For parallel work, the model can launch subprocesses from a short cell, redirect
-output to explicit files, and retain their handles. A completed cell does not
-mean those subprocesses finished. Ordinary asyncio tasks may stop advancing
-between cells; they are not durable background jobs.
-
-The model is encouraged to compose operations, write useful wrappers, batch work,
-cache results, and inspect data with Python. Large objects stay in memory; only
-useful evidence needs to enter the conversation.
-
-For example, these are tool arguments, not functions injected into IPython:
+Conceptually, model tool calls look like this:
 
 ```text
 python(code="from pathlib import Path; print(Path('pyproject.toml').read_text())", yield_after=1)
-# A quick read can return its result in this call, without a separate job poll.
-
-python(code="import time; print('started', flush=True); time.sleep(20); print('done')")
-# Returns {"job_id": "...", "status": "running", ...}
-
-job(id="...", wait=10)       # New output, status, and a byte cursor
-job(id="...", cursor=0)      # Reread from the start without rerunning code
-job(id="...", cancel=true)   # Request interruption; wait/read to confirm completion
-job()                       # List retained jobs and their log paths
+python(code="import subprocess; build = subprocess.Popen([...], stdout=open('build.log', 'w'))")
+job(id="...", wait=10)
+job(id="...", cursor=0)
+job(id="...", cancel=true)
 ```
 
-Each job reports its state, elapsed time, working directory, interpreter generation,
-and log path. Standard output and standard error share a live log in arrival order.
-Subprocesses must flush their output for immediate progress visibility. Automatic
-reads advance a cursor; explicit cursor reads leave it unchanged. Output is capped
-at 48 KiB by default, retaining the first third and final two thirds when truncated.
-Complete logs stay on disk. The most recent 20 observed jobs are retained in memory;
-unobserved results are never evicted.
+For parallel work, the agent starts subprocesses from a short cell, writes their
+output to files, and retains their handles. A completed cell does not imply that
+those subprocesses have finished. Ordinary asyncio tasks may stop advancing
+between cells and should not be used as durable background jobs.
 
-Completion notices are appended once between model turns. A result already read
-through `job` needs no extra notice. When the model stops calling tools while a
-cell is still running, Lazarus waits for completion and gives the result back to
-the model before ending the request. Session exit stops the worker and its process
-group. Processes deliberately detached into their own groups must be managed by
-the model.
+Tool output sent back to the model is capped at 48 KiB by default; the complete
+combined stdout/stderr stream remains in the job log. Terminal previews are even
+shorter unless `--verbose` is enabled. Use `--tool-output-limit-kib` when a task
+needs more output in context.
 
-When `start_new_loop` succeeds, Lazarus retains only:
+## Sessions, interruption, and recovery
 
-1. The original user task for the current request.
-2. The assistant's handoff tool call.
-3. The handoff tool result.
+By default, session data is stored under:
 
-The system prompt, interpreter, jobs, and logs stay unchanged. The retained tool
-call makes the reset explicit. Ordinary turns only append messages; completion
-notices and working-directory changes do not rewrite the system prompt or earlier
-messages. This preserves a stable prefix for provider-side caching between resets;
-actual cache use depends on the provider.
+```text
+~/.local/state/lazarus/sessions/<timestamp>-<id>/
+├── journal.jsonl
+└── jobs/*.log
+```
 
-## Sessions and recovery
+The journal is append-only. A complete assistant response is persisted before any
+tool call executes, so a dropped model stream cannot dispatch a partial call.
+Interrupted or uncertain calls are marked and never replayed automatically.
 
-Each session prints its directory under `~/.local/state/lazarus/sessions/`.
-Its append-only `journal.jsonl` records messages, calls, job outcomes, and context
-resets. Job logs live in its `jobs/` directory. These files persist after exit;
-delete old session directories when no longer needed.
+`--resume DIR` restores the conversation and last working directory, but starts a
+**fresh interpreter**. Files and logs survive; Python variables, objects, and old
+job handles do not. The original system prompt is retained, including its starting
+working directory, local date (`YYYY-MM-DD`), and skill index. A lock prevents two
+processes from resuming the same journal.
+
+On Ctrl-C or timeout, Lazarus first interrupts the worker process group. If the
+worker recovers, Python state remains available; otherwise Lazarus reports that
+state was lost and creates a fresh worker on the next cell. Filesystem writes and
+other partial side effects are never rolled back. Session exit stops the worker
+and its process group, but deliberately detached processes must be managed
+separately.
+
+## Long-context behavior
+
+At 150,000 context tokens, Lazarus asks the model to save useful state in a
+handoff and call `start_new_loop`. A successful reset retains only the current
+user task, the handoff call, and its result; the IPython worker and on-disk evidence
+stay intact. Change the threshold with `--loop-token-limit`.
+
+The system prompt and ordinary history are not rewritten between turns. Keeping
+that prefix stable makes provider-side prompt caching possible. The context number
+shown in the terminal is the latest model call's input plus output; session token
+totals are cumulative for the current process and restart on resume.
+
+## Skills
+
+Lazarus discovers optional `SKILL.md` files globally and from the current project
+up to its Git root. Only a compact name, description, and path index enters the
+system prompt; the agent reads full instructions from disk when needed.
 
 ```sh
-lazarus --session-dir ./my-session --prompt "fix the failing tests"
-lazarus --resume ./my-session
+# Project-local: .agents/skills/
+bunx skills add <repo-or-path> --agent universal
+
+# Global: ~/.agents/skills/
+bunx skills add <repo-or-path> --agent universal --global
 ```
 
-Resume restores the conversation, task, and last known working directory with a
-**fresh interpreter**, keeping the original system prompt. It reads the journal
-one record at a time instead of loading discarded context loops into memory. It never
-replays cells or restores live Python objects. It explicitly marks missing tool
-results as unknown and tells the model to inspect files, logs, and any surviving
-processes before retrying. Only a partial final journal write is trimmed during
-recovery. A session lock prevents two agents from resuming the same journal.
+Each skill needs YAML frontmatter with `name` and `description`. The nearest
+project definition wins; `disable-model-invocation: true` hides a skill from the
+index. The index is fixed when a session starts, so begin a new session after
+changing skill metadata.
 
-## Context and token usage
+## Implementation
 
-Interactive terminal sessions use `You:` and `Lazarus:` labels and show one
-compact session-token summary after each completed reply. Empty input is ignored.
+The request path is deliberately small:
 
-With `--prompt` or redirected input/output, each model response still produces a
-`LAZARUS_TOKEN_USAGE` JSON record with cumulative input, cache-read, cache-creation,
-output, total, and successful loop-reset counts. This makes long agent runs
-measurable without changing the
-model conversation. Reset counts remain telemetry and are not added to the
-system prompt.
+1. `cli.py` builds a stable system prompt and sends history and tool schemas to a
+   provider through `kosong`.
+2. The full model response is appended to the session journal.
+3. `jobs.py` dispatches cells to one supervised IPython child in `runtime.py`.
+4. A private JSON channel carries bounded control metadata; cell stdout/stderr goes
+   directly to a log, so arbitrary output cannot corrupt the protocol.
+5. Tool results are appended to history and generation continues until the model
+   stops calling tools or explicitly starts a new context loop.
 
-Automatic steering uses the size of the latest context, not cumulative billing
-usage. Cached and uncached input are counted once, along with the latest output.
-At 150,000 tokens by default, Lazarus adds one user message asking the model to
-compact its useful state into a handoff and call `start_new_loop`. Change the
-threshold with `--loop-token-limit`. A successful reset clears that loop's
-steering state while lifetime usage totals continue accumulating.
+```text
+src/lazarus/cli.py            CLI, providers, tools, and agent loop
+src/lazarus/jobs.py           job lifecycle, output limits, and cancellation
+src/lazarus/runtime.py        IPython worker supervision and recovery
+src/lazarus/python_worker.py  cell execution and live output capture
+src/lazarus/session.py        append-only journal and resume logic
+src/lazarus/skills.py         skill discovery and prompt catalog
+```
 
 ## Development
 
 ```sh
 uv run python -m lazarus.cli --help
-ruff check src
-ruff format --check src
-pyright --pythonpath .venv/bin/python src
-```
-
-The implementation is intentionally small:
-
-```text
-src/lazarus/cli.py            providers, tools, and agent loop
-src/lazarus/jobs.py           yielding jobs, progress, and cancellation
-src/lazarus/runtime.py        worker supervision and recovery
-src/lazarus/python_worker.py  persistent IPython worker and live output
-src/lazarus/session.py        append-only journal and conversation recovery
+uv run python -m unittest discover -s tests
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run pyright --pythonpath .venv/bin/python src
 ```
 
 ## License

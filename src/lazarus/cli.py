@@ -6,6 +6,7 @@ import signal
 from pathlib import Path
 import sys
 from dataclasses import dataclass
+from datetime import date
 from importlib.metadata import version
 from typing import cast
 
@@ -27,6 +28,7 @@ from lazarus.runtime import (
 
 
 SYSTEM_PROMPT = """You are Lazarus, a coding agent working in {cwd}.
+Current date: {current_date}.
 Help the user by reading files, running commands, editing code, and verifying results.
 You are communicating in a terminal. Keep responses easy to read there: use plain
 text or simple Markdown (short paragraphs, bullets, and code blocks when useful).
@@ -353,11 +355,12 @@ def _print_token_usage(totals: TokenTotals, *, interactive: bool = False) -> Non
     print(f"{TOKEN_USAGE_PREFIX}{json.dumps(totals.as_dict(), separators=(',', ':'))}")
 
 
-def _system_prompt(cwd: str) -> str:
+def _system_prompt(cwd: str, *, current_date: date | None = None) -> str:
     catalog, warnings = skills_prompt(Path(cwd))
     for warning in warnings:
         print(f"Skill warning: {warning}", file=sys.stderr)
-    return SYSTEM_PROMPT.format(cwd=cwd) + catalog
+    current_date = current_date or date.today()
+    return SYSTEM_PROMPT.format(cwd=cwd, current_date=current_date.isoformat()) + catalog
 
 
 async def run_request(

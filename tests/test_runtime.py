@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import redirect_stdout
+from datetime import date
 from io import StringIO
 from importlib.metadata import version
 import os
@@ -148,6 +149,11 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(135, totals.loop_context_tokens)
         self.assertEqual(240, totals.total)
+
+    def test_system_prompt_includes_current_date(self) -> None:
+        prompt = _system_prompt("/workspace", current_date=date(2026, 9, 26))
+
+        self.assertIn("Current date: 2026-09-26.", prompt)
 
     def test_system_prompt_does_not_include_loop_count(self) -> None:
         prompt = _system_prompt("/workspace")
