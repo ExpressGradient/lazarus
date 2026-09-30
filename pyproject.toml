@@ -17,6 +17,7 @@ dependencies = [
     "kosong[contrib]>=0.53.0",
     "pyyaml>=6.0.2",
     "pyjwt[crypto]>=2.12.1",
+    "pillow>=11.0.0",
 ]
 
 [project.scripts]

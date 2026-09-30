@@ -23,3 +23,4 @@ env.sh
 !/tests/test_python_worker.py
 !/tests/test_recovery.py
 !/tests/test_chatgpt.py
+!/tests/test_images.py

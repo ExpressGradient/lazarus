@@ -138,6 +138,30 @@ combined stdout/stderr stream remains in the job log. Terminal previews are even
 shorter unless `--verbose` is enabled. Use `--tool-output-limit-kib` when a task
 needs more output in context.
 
+### Images and plots
+
+Reference an image path in your request, for example: "Inspect `screenshots/page.png`
+and fix the layout." The agent can read it through the existing Python tool:
+
+```python
+show_image("screenshots/page.png")  # local path or encoded image bytes
+show_image(image)                   # PIL image
+show_image(fig)                     # matplotlib figure; install matplotlib if needed
+```
+
+`show_image` sends actual pixels to the selected model when the cell finishes,
+including through background job completion. The terminal shows only a short
+summary. Creating an image or printing its path does not send it; no extra tool
+or vision model is used. Select a model that supports image input.
+
+Images are normalized to PNG, bounded to 2048 pixels per side and 4 MiB each,
+with at most eight per cell. Inputs are capped at 20 MiB and 25 million pixels;
+animated images use their first frame. Snapshots are saved in `jobs/<job-id>.images/`
+and delivered once per job, independently of text-output limits. To inspect an
+image again after a context reset, call `show_image` on its saved path. Delivered
+pixels are also retained in the journal for resume. Images are sent to your model
+provider, so avoid showing sensitive content unintentionally.
+
 ## Sessions, interruption, and recovery
 
 By default, session data is stored under:

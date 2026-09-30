@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 
+from kosong.message import TextPart
 from kosong.tooling import ToolReturnValue
 
 
@@ -11,9 +12,13 @@ from kosong.tooling import ToolReturnValue
 _ESCAPES = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def result_text(value: ToolReturnValue) -> str:
-    parts = [str(value.output)] if value.output else []
-    if value.message:
+def result_text(value: ToolReturnValue, *, include_message: bool = True) -> str:
+    parts = (
+        [value.output]
+        if isinstance(value.output, str)
+        else [part.text for part in value.output if isinstance(part, TextPart)]
+    )
+    if include_message and value.message:
         parts.append(value.message)
     return "\n".join(parts).rstrip() or "(no output)"
 
@@ -40,7 +45,7 @@ class ToolDisplay:
             print(f"\n[{label}]\n{result_text(value)}", flush=True)
             return
         try:
-            data = json.loads(str(value.output))
+            data = json.loads(result_text(value, include_message=False))
         except (ValueError, TypeError):
             data = None
         if isinstance(data, dict) and "job_id" in data:
@@ -74,8 +79,17 @@ class ToolDisplay:
                 self._cursors[job_id] = cursor
                 if output and not value.is_error:
                     self._preview(str(output))
-            elif changed and status == "completed" and not seen and not output:
+            elif (
+                changed
+                and status == "completed"
+                and not seen
+                and not output
+                and not data.get("images")
+            ):
                 print("    (no output)", flush=True)
+            if changed:
+                for path in data.get("images", []):
+                    print(f"    Image · {self._brief(path)}", flush=True)
         elif value.is_error:
             print(
                 f"  Tool error · {self._brief(value.message or value.brief)}",

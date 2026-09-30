@@ -9,8 +9,10 @@ import time
 from typing import Callable
 from uuid import uuid4
 
+from kosong.message import ImageURLPart, TextPart
 from kosong.tooling import ToolError, ToolOk, ToolReturnValue
 
+from lazarus.images import load_images
 from lazarus.runtime import PythonRuntime
 
 
@@ -29,6 +31,8 @@ class Job:
     finished: float | None = None
     cursor: int = 0
     notified: bool = False
+    images: list[ImageURLPart] = field(default_factory=list)
+    images_sent: bool = False
 
 
 class Jobs:
@@ -114,6 +118,7 @@ class Jobs:
                 "Worker exited": "lost",
                 "Worker failed": "lost",
             }.get(job.result.brief, "failed" if job.result.is_error else "completed")
+            job.images = load_images(job.output_path)
         except Exception as exc:
             job.result = ToolError(
                 message=f"Job failed: {type(exc).__name__}: {exc}", brief="Job failed"
@@ -129,6 +134,7 @@ class Jobs:
                 message=job.result.message,
                 generation=self.runtime.generation,
                 cwd=self.runtime.cwd,
+                images=[image.image_url.id for image in job.images],
             )
 
     async def inspect(
@@ -158,7 +164,13 @@ class Jobs:
             return ToolError(message=str(exc), brief="Invalid cursor")
         if job.status != "running":
             job.notified = True
+        return self._result(job, data)
+
+    def _result(self, job: Job, data: dict[str, object]) -> ToolReturnValue:
         output = json.dumps(data, ensure_ascii=False)
+        if job.images and not job.images_sent:
+            output = [TextPart(text=output), *job.images]
+            job.images_sent = True
         if job.result is not None and job.result.is_error:
             return ToolError(
                 message=job.result.message, output=output, brief=job.result.brief
@@ -199,6 +211,8 @@ class Jobs:
             "interpreter_alive": self.runtime._process is not None
             and self.runtime._process.returncode is None,
         }
+        if job.images:
+            data["images"] = [image.image_url.id for image in job.images]
         if job.cancel.is_set() and job.status == "running":
             data["cancel_requested"] = True
         if job.result is not None and job.result.message:
@@ -217,13 +231,13 @@ class Jobs:
             ]
         )
 
-    def notifications(self) -> list[str]:
+    def notifications(self) -> list[ToolReturnValue]:
         notices = []
         for job in self.jobs.values():
             if job.status != "running" and not job.notified:
                 if job.task is not None and job.task.done():
                     job.task.result()
-                notices.append(json.dumps(self.snapshot(job), ensure_ascii=False))
+                notices.append(self._result(job, self.snapshot(job)))
                 job.notified = True
         return notices
 

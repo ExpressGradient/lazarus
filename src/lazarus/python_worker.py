@@ -8,6 +8,8 @@ from typing import BinaryIO, NotRequired, TypedDict
 from IPython.core.interactiveshell import InteractiveShell
 from traitlets.config import Config
 
+from lazarus.images import image_output, show_image
+
 
 os.environ.setdefault(
     "IPYTHONDIR", os.path.join(tempfile.gettempdir(), "lazarus-ipython")
@@ -24,7 +26,9 @@ def create_shell() -> InteractiveShell:
     config = Config()
     config.HistoryManager.hist_file = ":memory:"
     config.InteractiveShell.colors = "nocolor"
-    return InteractiveShell.instance(config=config)
+    shell = InteractiveShell.instance(config=config)
+    shell.user_ns["show_image"] = show_image
+    return shell
 
 
 def _flush(stream: object) -> None:
@@ -55,7 +59,8 @@ def execute_cell(shell: InteractiveShell, code: str, output_path: str) -> CellRe
         result = None
         infrastructure_error: BaseException | None = None
         try:
-            result = shell.run_cell(code, store_history=False, silent=False)
+            with image_output(output_path):
+                result = shell.run_cell(code, store_history=False, silent=False)
         except BaseException as exc:
             infrastructure_error = exc
         finally:
