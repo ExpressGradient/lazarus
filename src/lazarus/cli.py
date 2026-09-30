@@ -13,7 +13,7 @@ from collections.abc import Iterable
 
 import kosong
 from kosong.chat_provider import ChatProvider, ThinkingEffort, TokenUsage
-from kosong.message import ImageURLPart, Message, TextPart, ToolCall
+from kosong.message import ContentPart, ImageURLPart, Message, TextPart, ToolCall
 from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolResult, ToolReturnValue
 from kosong.tooling.simple import SimpleToolset
 from pydantic import BaseModel, ConfigDict, Field
@@ -337,7 +337,9 @@ def _tool_message(result: ToolResult) -> Message:
 
 def _image_message(values: Iterable[ToolReturnValue]) -> Message | None:
     # Tool-image support varies by provider; append a user message after all results.
-    content = [TextPart(text="Images emitted by Python (tool output):")]
+    content: list[ContentPart] = [
+        TextPart(text="Images emitted by Python (tool output):")
+    ]
     for value in values:
         if isinstance(value.output, list):
             for part in value.output:
@@ -730,9 +732,11 @@ def main() -> None:
         chat = create_chat_provider(args)
 
         async def execute():
+            from lazarus.chatgpt import ChatGPT
+
             try:
                 if args.provider == "chatgpt":
-                    await chat.prepare()
+                    await cast(ChatGPT, chat).prepare()
                 await run(
                     chat,
                     args.prompt,
@@ -744,7 +748,7 @@ def main() -> None:
                 )
             finally:
                 if args.provider == "chatgpt":
-                    await chat.close()
+                    await cast(ChatGPT, chat).close()
 
         asyncio.run(execute())
     except KeyboardInterrupt:

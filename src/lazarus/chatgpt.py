@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import httpx
-from openai import OpenAIError
+from openai import AsyncStream, OpenAIError
+from openai.types.responses import ResponseInputParam, ResponseStreamEvent, ToolParam
 from kosong.chat_provider import ChatProviderError
 from kosong.chat_provider.openai_common import convert_error
 from kosong.contrib.chat_provider.openai_responses import (
@@ -55,7 +56,7 @@ class ChatGPT(OpenAIResponses):
         await self.prepare()
         token = await asyncio.to_thread(self.auth.access_token)
         inputs = [
-            item for message in history for item in self._convert_message(message)
+            dict(item) for message in history for item in self._convert_message(message)
         ]
         for item in inputs:
             if item.get("role") == "system":
@@ -70,17 +71,21 @@ class ChatGPT(OpenAIResponses):
             response = await self._client.responses.create(
                 model=self._model,
                 instructions=system_prompt,
-                input=inputs,
-                tools=[
-                    {
-                        "type": "namespace",
-                        "name": "lazarus",
-                        "description": "Lazarus local tools",
-                        "tools": [_convert_tool(t) for t in tools],
-                    }
-                ]
-                if tools
-                else [],
+                input=cast(ResponseInputParam, inputs),
+                # ChatGPT namespaces are not yet represented in the SDK types.
+                tools=cast(
+                    list[ToolParam],
+                    [
+                        {
+                            "type": "namespace",
+                            "name": "lazarus",
+                            "description": "Lazarus local tools",
+                            "tools": [_convert_tool(t) for t in tools],
+                        }
+                    ]
+                    if tools
+                    else [],
+                ),
                 stream=True,
                 store=False,
                 include=["reasoning.encrypted_content"],
@@ -124,7 +129,10 @@ class ChatGPTStream(OpenAIResponsesStreamedMessage):
                 )
 
         try:
-            async for part in super()._convert_stream_response(checked()):
+            # The upstream converter only iterates; it does not need stream methods.
+            async for part in super()._convert_stream_response(
+                cast(AsyncStream[ResponseStreamEvent], checked())
+            ):
                 yield part
         finally:
             await response.close()

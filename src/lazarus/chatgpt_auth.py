@@ -140,7 +140,7 @@ class ChatGPTAuth:
                 self.request.settimeout(5)
                 super().setup()
 
-            def log_message(self, *_):
+            def log_message(self, format: str, *args: object) -> None:
                 pass
 
             def do_GET(self):

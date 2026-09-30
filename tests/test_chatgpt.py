@@ -351,7 +351,10 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
             stream = await provider.generate(
                 "instructions",
                 [Tool(name="python", description="run", parameters={"type": "object"})],
-                [Message(role="user", content="hello")],
+                [
+                    Message(role="system", content="system guidance"),
+                    Message(role="user", content="hello"),
+                ],
             )
             parts = [part async for part in stream]
         self.assertIsInstance(parts[0], ToolCall)
@@ -362,6 +365,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         body = json.loads(request.content)
         self.assertTrue(body["stream"])
         self.assertFalse(body["store"])
+        self.assertEqual("developer", body["input"][0]["role"])
         self.assertEqual("namespace", body["tools"][0]["type"])
         call = ToolCall(
             id="call", function=ToolCall.FunctionBody(name="python", arguments="{}")
