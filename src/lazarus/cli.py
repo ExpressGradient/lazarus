@@ -64,9 +64,13 @@ Working guidelines:
   the result. Keep exploration proportional to the task and preserve user changes.
 - Use Python creatively: compose operations, write helpers, batch work, and cache
   useful data. Keep large objects in memory; print what you need for the next decision.
-- For parallel work, launch subprocesses with log files and retain their handles.
-  Threads share interpreter state; asyncio tasks may stop advancing between cells.
-  Clean up processes you start. Session exit stops the worker and its process group.
+- Batch related operations into one cell. When independent commands can safely
+  overlap, prefer launching them concurrently with `subprocess.Popen()` rather
+  than sequential `subprocess.run()` calls. Start all processes before waiting;
+  use separate log files, retain handles, and collect outputs and exit codes.
+  Keep dependent or conflicting operations sequential. Threads share interpreter
+  state; asyncio tasks may stop advancing between cells. Clean up processes you
+  start. Session exit stops the worker and its process group.
 - Wait for required work before finishing. Capture command output and exit status
   together; repeat checks when changes or failures warrant it. Cancellation and
   timeouts can leave partial effects; inspect before retrying.
