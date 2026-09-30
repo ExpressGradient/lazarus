@@ -24,9 +24,9 @@ to exit and Ctrl-C to stop the current turn without exiting Lazarus.
 # Complete one task and exit
 lazarus --prompt "find the failing tests, fix the cause, and verify the fix"
 
-# Use Codex through an existing ChatGPT login
-codex login
-lazarus --provider codex --thinking-effort high
+# Use your ChatGPT plan
+lazarus auth login
+lazarus --provider chatgpt --thinking-effort high
 
 # Pin a provider and model
 lazarus --provider anthropic --model claude-opus-5
@@ -61,7 +61,7 @@ The default provider is Kimi. Lazarus uses `kosong` and supports:
 
 ```sh
 lazarus --provider kimi       # default: kimi-k3
-lazarus --provider codex      # default: gpt-5.6-sol; requires `codex login`
+lazarus --provider chatgpt    # first available account model; requires `lazarus auth login`
 lazarus --provider openai     # default: gpt-5.6-sol
 lazarus --provider anthropic  # default: claude-opus-5
 lazarus --provider google     # default: gemini-3.7-flash
@@ -74,6 +74,34 @@ For servers that return reasoning in a separate field, set
 `OPENAI_REASONING_KEY` (for example, `reasoning_content`). Use `--model` to
 override any provider default and `--thinking-effort` to select `off`, `low`,
 `medium`, `high`, `xhigh`, or `max` where supported.
+
+### ChatGPT sign-in
+
+The `chatgpt` provider uses OpenAI's official [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
+flow for eligible Plus/Pro accounts. It uses your existing plan allowance, with
+limits managed in ChatGPT settings. No Codex installation or API key is needed.
+
+```sh
+lazarus auth login                 # browser sign-in; expires after 3 minutes
+lazarus auth status
+lazarus auth models                # available model IDs, in server order
+lazarus --provider chatgpt --model MODEL_ID
+lazarus auth logout
+
+# Keep another account/workspace under a separate label
+lazarus auth login --account work
+lazarus --provider chatgpt --account work
+lazarus auth logout --account work
+```
+
+Credentials live in `~/.config/lazarus/chatgpt.json` (or under `XDG_CONFIG_HOME`),
+with owner-only permissions and atomic token rotation. Account labels default to
+`default`; reuse a label to sign back into its original account/workspace. Use a
+new label for another registration. Logout clears local tokens and attempts remote
+revocation, while retaining the registration for future login.
+
+This replaces `--provider codex`: run `lazarus auth login` once and use
+`--provider chatgpt`. Existing Codex credentials are never read or changed.
 
 ## What the agent can do
 

@@ -63,10 +63,10 @@ Working guidelines:
 - Be concise. Report what changed, what you verified, and any remaining limits.
 """
 
-PROVIDERS = ("anthropic", "codex", "google", "kimi", "openai", "openai-legacy")
+PROVIDERS = ("anthropic", "chatgpt", "google", "kimi", "openai", "openai-legacy")
 DEFAULT_MODELS = {
     "anthropic": "claude-opus-5",
-    "codex": "gpt-5.6-sol",
+    "chatgpt": "",
     "google": "gemini-3.7-flash",
     "kimi": "kimi-k3",
     "openai": "gpt-5.6-sol",
@@ -168,6 +168,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Resume a session with a fresh interpreter; never replay cells.",
     )
+    parser.add_argument(
+        "--account", default="default", help="Saved ChatGPT account label."
+    )
+    commands = parser.add_subparsers(dest="command")
+    auth = commands.add_parser("auth", help="Manage ChatGPT sign-in.")
+    auth.add_argument("action", choices=("login", "status", "logout", "models"))
+    auth.add_argument(
+        "--account",
+        default=argparse.SUPPRESS,
+        help="Account label; use a new label to add an account/workspace.",
+    )
     return parser
 
 
@@ -181,10 +192,10 @@ def create_chat_provider(args: argparse.Namespace) -> ChatProvider:
         model = DEFAULT_MODELS[provider]
 
     match provider:
-        case "codex":
-            from lazarus.codex_chatgpt import CodexChatGPT
+        case "chatgpt":
+            from lazarus.chatgpt import ChatGPT
 
-            chat = CodexChatGPT(model=model)
+            chat = ChatGPT(model=model, account=args.account)
         case "kimi":
             from kosong.chat_provider.kimi import Kimi
 
@@ -647,18 +658,44 @@ def main() -> None:
     if args.loop_token_limit <= 0:
         parser.error("--loop-token-limit must be positive")
     try:
+        if args.command == "auth":
+            from lazarus.chatgpt_auth import ChatGPTAuth
+
+            if args.action == "models":
+                from lazarus.chatgpt import ChatGPT
+
+                async def list_models():
+                    provider = ChatGPT(account=args.account)
+                    try:
+                        for model in await provider.models():
+                            print(f"{model['slug']}  {model.get('display_name', '')}")
+                    finally:
+                        await provider.close()
+
+                asyncio.run(list_models())
+            else:
+                getattr(ChatGPTAuth(args.account), args.action)()
+            return
         chat = create_chat_provider(args)
-        asyncio.run(
-            run(
-                chat,
-                args.prompt,
-                args.loop_token_limit,
-                args.tool_output_limit_kib,
-                args.session_dir,
-                args.resume,
-                args.verbose,
-            )
-        )
+
+        async def execute():
+            try:
+                if args.provider == "chatgpt":
+                    await chat.prepare()
+                await run(
+                    chat,
+                    args.prompt,
+                    args.loop_token_limit,
+                    args.tool_output_limit_kib,
+                    args.session_dir,
+                    args.resume,
+                    args.verbose,
+                )
+            finally:
+                if args.provider == "chatgpt":
+                    await chat.close()
+
+        asyncio.run(execute())
     except KeyboardInterrupt:
         print("\nStopped.")
     except Exception as exc:

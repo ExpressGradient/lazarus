@@ -572,6 +572,7 @@ source = { editable = "." }
 dependencies = [
     { name = "ipython" },
     { name = "kosong", extra = ["contrib"] },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pyyaml" },
 ]
 
@@ -579,6 +580,7 @@ dependencies = [
 requires-dist = [
     { name = "ipython", specifier = ">=9.15.0" },
     { name = "kosong", extras = ["contrib"], specifier = ">=0.53.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.12.1" },
     { name = "pyyaml", specifier = ">=6.0.2" },
 ]
 
