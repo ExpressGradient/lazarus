@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 from openai import AsyncStream, OpenAIError
@@ -27,6 +28,8 @@ class ChatGPT(OpenAIResponses):
 
     def __init__(self, *, model: str = "", account: str = "default"):
         self.auth = ChatGPTAuth(account)
+        # ChatGPT uses session-id for cache affinity across requests.
+        self._session_id = str(uuid4())
         super().__init__(
             model=model, api_key="oauth", base_url=RESOURCE, max_retries=0, stream=True
         )
@@ -89,7 +92,10 @@ class ChatGPT(OpenAIResponses):
                 stream=True,
                 store=False,
                 include=["reasoning.encrypted_content"],
-                extra_headers={"Authorization": f"Bearer {token}"},
+                extra_headers={
+                    "Authorization": f"Bearer {token}",
+                    "session-id": self._session_id,
+                },
                 **kwargs,
             )
             return ChatGPTStream(response)

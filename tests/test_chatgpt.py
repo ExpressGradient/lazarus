@@ -383,6 +383,52 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("lazarus", body["input"][0]["namespace"])
         self.assertEqual("call", body["input"][1]["call_id"])
 
+    async def test_session_id_survives_appends_configuration_and_token_refresh(self):
+        events = [
+            {
+                "type": "response.completed",
+                "response": {"id": "response", "usage": None},
+            }
+        ]
+        requests = []
+        provider = await self.provider(events, requests)
+        history = [Message(role="user", content="hello")]
+        stream = await provider.generate("instructions", [], history)
+        _ = [part async for part in stream]
+
+        provider = provider.with_generation_kwargs(reasoning_effort="high")
+        provider.auth = SimpleNamespace(access_token=lambda: "refreshed-token")
+        history.extend(
+            [
+                Message(role="assistant", content="hello"),
+                Message(role="user", content="continue"),
+            ]
+        )
+        stream = await provider.generate("instructions", [], history)
+        _ = [part async for part in stream]
+
+        session_id = requests[0].headers["session-id"]
+        self.assertTrue(session_id)
+        self.assertEqual(session_id, requests[1].headers["session-id"])
+        self.assertEqual("Bearer refreshed-token", requests[1].headers["authorization"])
+
+    async def test_separate_providers_have_distinct_session_ids(self):
+        events = [
+            {
+                "type": "response.completed",
+                "response": {"id": "response", "usage": None},
+            }
+        ]
+        requests = []
+        for _ in range(2):
+            provider = await self.provider(events, requests)
+            stream = await provider.generate("instructions", [], [])
+            _ = [part async for part in stream]
+
+        self.assertNotEqual(
+            requests[0].headers["session-id"], requests[1].headers["session-id"]
+        )
+
     async def test_failed_incomplete_and_truncated_streams_raise(self):
         for terminal in (None, "response.failed", "response.incomplete"):
             with self.subTest(terminal=terminal):
