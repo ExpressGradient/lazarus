@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -20,6 +21,14 @@ import webbrowser
 
 import httpx
 import jwt
+
+from lazarus.chatgpt_errors import (
+    ChatGPTError,
+    REFRESH_REJECTED,
+    response_error,
+    retry_delay,
+    transport_error,
+)
 
 ISSUER = "https://auth.openai.com"
 RESOURCE = "https://api.openai.com/v1"
@@ -40,12 +49,9 @@ def _save(path: Path, value: dict) -> None:
             os.unlink(temporary)
 
 
-def _json(response: httpx.Response) -> dict:
+def _json(response: httpx.Response, operation: str = "authentication") -> dict:
     if response.is_error:
-        # Never include response bodies or authorization URLs in diagnostics.
-        raise ValueError(
-            f"ChatGPT authentication failed (HTTP {response.status_code}); run `lazarus auth login` again."
-        )
+        raise response_error(operation, response)
     return response.json()
 
 
@@ -103,10 +109,54 @@ class ChatGPTAuth:
                 raise ValueError(
                     f"ChatGPT account {self.account!r} is signed out; run `lazarus auth login`."
                 )
-            if record.get("expires_at", 0) <= time.time() + 60:
-                with httpx.Client(timeout=30) as client:
-                    tokens = _json(
-                        client.post(
+            expires = record.get("expires_at", 0)
+            earliest = record.get("earliest_refresh_at", 0)
+            try:
+                earliest = float(earliest)
+            except (TypeError, ValueError):
+                try:
+                    earliest = datetime.fromisoformat(
+                        str(earliest).replace("Z", "+00:00")
+                    ).timestamp()
+                except ValueError:
+                    earliest = 0
+            if not math.isfinite(earliest):
+                earliest = 0
+            if expires <= time.time() + 60 and earliest <= time.time():
+                try:
+                    tokens = self._refresh(record)
+                except ChatGPTError as error:
+                    if error.code in REFRESH_REJECTED:
+                        for key in (
+                            "access_token",
+                            "refresh_token",
+                            "id_token",
+                            "expires_at",
+                            "earliest_refresh_at",
+                        ):
+                            record.pop(key, None)
+                        _save(self.path, data)
+                    raise
+                updated = self._tokens(tokens)
+                updated.setdefault("scope", record.get("scope", ""))
+                record.pop("earliest_refresh_at", None)
+                record.update(updated)
+                _save(self.path, data)
+            elif expires <= time.time():
+                raise ChatGPTError("token refresh", code="refresh_not_ready")
+            if "chatgpt.tokens.use.direct" not in record.get("scope", "").split():
+                raise ValueError(
+                    "ChatGPT plan usage was not authorized; run `lazarus auth login`."
+                )
+            return record["access_token"]
+
+    def _refresh(self, record: dict) -> dict:
+        # The caller holds the credential lock through rotation and atomic save.
+        with httpx.Client(timeout=30) as client:
+            for attempt in range(3):
+                try:
+                    try:
+                        response = client.post(
                             TOKEN_URL,
                             data={
                                 "grant_type": "refresh_token",
@@ -115,16 +165,16 @@ class ChatGPTAuth:
                                 "resource": RESOURCE,
                             },
                         )
-                    )
-                updated = self._tokens(tokens)
-                updated.setdefault("scope", record.get("scope", ""))
-                record.update(updated)
-                _save(self.path, data)
-            if "chatgpt.tokens.use.direct" not in record.get("scope", "").split():
-                raise ValueError(
-                    "ChatGPT plan usage was not authorized; run `lazarus auth login`."
-                )
-            return record["access_token"]
+                    except httpx.HTTPError as error:
+                        raise transport_error("token refresh", error) from error
+                    return _json(response, "token refresh")
+                except ChatGPTError as error:
+                    delay = retry_delay(error, attempt)
+                    if delay is None:
+                        error.retryable = False
+                        raise
+                    time.sleep(delay)
+        raise AssertionError("unreachable")
 
     def login(self) -> None:
         state, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(3))

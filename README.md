@@ -103,6 +103,15 @@ revocation, while retaining the registration for future login.
 This replaces `--provider codex`: run `lazarus auth login` once and use
 `--provider chatgpt`. Existing Codex credentials are never read or changed.
 
+Access tokens refresh automatically near expiry. Temporary refresh and inference
+failures get at most two retries with backoff; plan limits and invalid requests
+are reported without retrying. A refresh with an uncertain delivery outcome stops
+without retrying or clearing credentials, since its token may already have rotated.
+Failed inference streams are discarded before tools execute.
+Retries keep the live interpreter and conversation ID; `--resume` restores that ID
+from the journal. Temporary failures never clear saved credentials. Retry notices
+include safe error codes and request IDs, never tokens or response bodies.
+
 ## What the agent can do
 
 The model receives three tools:

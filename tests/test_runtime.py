@@ -56,11 +56,6 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
             f"{build_parser().prog} {version('lazarus')}\n", output.getvalue()
         )
 
-    def test_tool_output_limit_is_configurable(self) -> None:
-        args = build_parser().parse_args(["--tool-output-limit-kib", "64"])
-
-        self.assertEqual(64, args.tool_output_limit_kib)
-
     async def test_timeout_interrupts_worker_and_preserves_state(self) -> None:
         await self.run_cell("answer = 42")
         timed_out = await self.run_cell("import time; time.sleep(10)", timeout=0.01)

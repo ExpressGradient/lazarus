@@ -11,7 +11,6 @@ import httpx
 from openai import AsyncStream, OpenAIError
 from openai.types.responses import ResponseInputParam, ResponseStreamEvent, ToolParam
 from kosong.chat_provider import ChatProviderError
-from kosong.chat_provider.openai_common import convert_error
 from kosong.contrib.chat_provider.openai_responses import (
     OpenAIResponses,
     OpenAIResponsesStreamedMessage,
@@ -21,6 +20,12 @@ from kosong.message import Message
 from kosong.tooling import Tool
 
 from lazarus.chatgpt_auth import ChatGPTAuth, RESOURCE
+from lazarus.chatgpt_errors import (
+    ChatGPTError,
+    response_error,
+    retry_chatgpt,
+    transport_error,
+)
 
 
 class ChatGPT(OpenAIResponses):
@@ -35,13 +40,23 @@ class ChatGPT(OpenAIResponses):
         )
 
     async def models(self) -> list[dict]:
-        token = await asyncio.to_thread(self.auth.access_token)
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(
-                f"{RESOURCE}/models", headers={"Authorization": f"Bearer {token}"}
-            )
-            response.raise_for_status()
-        return [m for m in response.json()["models"] if m.get("visibility") == "list"]
+        async def request():
+            token = await asyncio.to_thread(self.auth.access_token)
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(
+                        f"{RESOURCE}/models",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+            except httpx.HTTPError as error:
+                raise transport_error("model discovery", error) from error
+            if response.is_error:
+                raise response_error("model discovery", response)
+            return [
+                m for m in response.json()["models"] if m.get("visibility") == "list"
+            ]
+
+        return await retry_chatgpt(request)
 
     async def prepare(self) -> None:
         if not self._model:
@@ -100,39 +115,54 @@ class ChatGPT(OpenAIResponses):
             )
             return ChatGPTStream(response)
         except (OpenAIError, httpx.HTTPError) as exc:
-            raise convert_error(exc) from exc
+            raise transport_error("inference", exc) from exc
 
 
 class ChatGPTStream(OpenAIResponsesStreamedMessage):
     async def _convert_stream_response(self, response):
+        request_id = response.response.headers.get("x-request-id")
+
         async def checked():
             completed = False
-            async for event in response:
-                if event.type in ("response.failed", "response.incomplete", "error"):
-                    error = getattr(getattr(event, "response", None), "error", None)
-                    code = (
-                        getattr(error, "code", None)
-                        or getattr(event, "code", None)
-                        or event.type
-                    )
-                    raise ChatProviderError(
-                        f"ChatGPT request failed: {code}. Check your plan usage or sign in again."
-                    )
-                if (
-                    event.type == "response.output_item.added"
-                    and event.item.type == "function_call"
-                ):
-                    if getattr(event.item, "namespace", None) not in (None, "lazarus"):
-                        raise ChatProviderError(
-                            "ChatGPT returned an unknown tool namespace."
+            try:
+                async for event in response:
+                    if event.type in (
+                        "response.failed",
+                        "response.incomplete",
+                        "error",
+                    ):
+                        result = getattr(event, "response", None)
+                        error = getattr(result, "error", None)
+                        details = getattr(result, "incomplete_details", None)
+                        code = (
+                            getattr(error, "code", None)
+                            or getattr(event, "code", None)
+                            or getattr(details, "reason", None)
+                            or event.type
                         )
-                if event.type == "response.completed":
-                    completed = True
-                yield event
-            if not completed:
-                raise ChatProviderError(
-                    "ChatGPT stream ended before response.completed; no tools were run."
-                )
+                        raise ChatGPTError(
+                            "inference", code=code, request_id=request_id
+                        )
+                    if (
+                        event.type == "response.output_item.added"
+                        and event.item.type == "function_call"
+                    ):
+                        if getattr(event.item, "namespace", None) not in (
+                            None,
+                            "lazarus",
+                        ):
+                            raise ChatProviderError(
+                                "ChatGPT returned an unknown tool namespace."
+                            )
+                    if event.type == "response.completed":
+                        completed = True
+                    yield event
+                if not completed:
+                    raise ChatGPTError(
+                        "inference", code="stream_interrupted", request_id=request_id
+                    )
+            except (OpenAIError, httpx.HTTPError) as exc:
+                raise transport_error("inference", exc) from exc
 
         try:
             # The upstream converter only iterates; it does not need stream methods.

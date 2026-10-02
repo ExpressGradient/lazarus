@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+import asyncio
+from contextlib import redirect_stdout, redirect_stderr
 from io import BytesIO, StringIO
 import json
 from pathlib import Path
@@ -7,7 +8,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -15,7 +16,7 @@ import httpx
 import jwt
 from kosong.chat_provider import ChatProviderError
 from kosong.message import Message, ToolCall
-from kosong.tooling import Tool
+from kosong.tooling import Tool, ToolOk, ToolResult
 
 from lazarus.chatgpt_auth import (
     ChatGPTAuth,
@@ -26,7 +27,19 @@ from lazarus.chatgpt_auth import (
     verify_identity,
 )
 from lazarus.chatgpt import ChatGPT
-from lazarus.cli import build_parser, create_chat_provider
+from lazarus.cli import (
+    build_parser,
+    create_chat_provider,
+    run,
+    run_request,
+    TokenTotals,
+)
+from lazarus.chatgpt_errors import (
+    ChatGPTError,
+    response_error,
+    retry_chatgpt,
+    retry_delay,
+)
 
 
 class AuthTests(unittest.TestCase):
@@ -138,6 +151,120 @@ class AuthTests(unittest.TestCase):
                 self.auth.access_token()
             self.assertNotIn("DO-NOT-PRINT", str(error.exception))
         self.assertEqual(before, self.auth.path.read_text())
+
+    def test_refresh_retries_transient_failures_and_saves_rotation(self):
+        self.seed()
+        with (
+            patch("lazarus.chatgpt_auth.httpx.Client") as client,
+            patch("lazarus.chatgpt_auth.time.sleep") as sleep,
+            redirect_stderr(StringIO()),
+        ):
+            post = client.return_value.__enter__.return_value.post
+            post.side_effect = [
+                httpx.ConnectError("DO-NOT-PRINT"),
+                httpx.Response(500, text="DO-NOT-PRINT"),
+                httpx.Response(200, json=self.tokens()),
+            ]
+            self.assertEqual(self.auth.access_token(), "access")
+            self.assertEqual(post.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(
+            json.loads(self.auth.path.read_text())["accounts"]["default"][
+                "refresh_token"
+            ],
+            "rotated",
+        )
+
+    def test_refresh_exhaustion_preserves_credentials_without_outer_retry(self):
+        self.seed()
+        before = self.auth.path.read_text()
+        with (
+            patch("lazarus.chatgpt_auth.httpx.Client") as client,
+            patch("lazarus.chatgpt_auth.time.sleep"),
+            redirect_stderr(StringIO()) as output,
+        ):
+            post = client.return_value.__enter__.return_value.post
+            post.return_value = httpx.Response(
+                500, text="DO-NOT-PRINT", headers={"x-request-id": "req-test"}
+            )
+
+            async def request():
+                return self.auth.access_token()
+
+            with self.assertRaises(ChatGPTError) as raised:
+                asyncio.run(retry_chatgpt(request))
+            self.assertEqual(post.call_count, 3)
+            self.assertIn("req-test", str(raised.exception))
+            self.assertNotIn("login", str(raised.exception))
+            self.assertNotIn("DO-NOT-PRINT", output.getvalue())
+        self.assertEqual(before, self.auth.path.read_text())
+
+    def test_terminal_refresh_rejection_clears_only_tokens(self):
+        self.seed()
+        with patch("lazarus.chatgpt_auth.httpx.Client") as client:
+            post = client.return_value.__enter__.return_value.post
+            post.return_value = httpx.Response(400, json={"error": "invalid_grant"})
+            with self.assertRaisesRegex(ChatGPTError, "auth login"):
+                self.auth.access_token()
+            self.assertEqual(post.call_count, 1)
+        record = json.loads(self.auth.path.read_text())["accounts"]["default"]
+        self.assertNotIn("refresh_token", record)
+        self.assertEqual(record["client_id"], "issued")
+        self.assertEqual(record["subject"], "user")
+
+    def test_ambiguous_refresh_does_not_retry_or_clear_credentials(self):
+        for failure in (
+            httpx.ReadTimeout,
+            httpx.ReadError,
+            httpx.WriteTimeout,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ):
+            with self.subTest(failure=failure.__name__):
+                self.seed()
+                before = self.auth.path.read_bytes()
+                with (
+                    patch("lazarus.chatgpt_auth.httpx.Client") as client,
+                    patch(
+                        "lazarus.chatgpt_errors.asyncio.sleep", new_callable=AsyncMock
+                    ) as sleep,
+                ):
+                    post = client.return_value.__enter__.return_value.post
+                    post.side_effect = [
+                        failure("DO-NOT-PRINT"),
+                        httpx.Response(400, json={"error": "invalid_grant"}),
+                    ]
+
+                    async def request():
+                        return await asyncio.to_thread(self.auth.access_token)
+
+                    with self.assertRaisesRegex(
+                        ChatGPTError, "refresh_outcome_unknown"
+                    ) as raised:
+                        asyncio.run(retry_chatgpt(request))
+                    self.assertIn(failure.__name__, str(raised.exception))
+                    self.assertNotIn("DO-NOT-PRINT", str(raised.exception))
+                    post.assert_called_once()
+                    sleep.assert_not_awaited()
+                self.assertEqual(before, self.auth.path.read_bytes())
+
+    def test_earliest_refresh_keeps_valid_token_and_blocks_expired_token(self):
+        self.seed()
+        with self.auth.locked() as data:
+            data["accounts"]["default"].update(
+                access_token="valid",
+                expires_at=time.time() + 30,
+                earliest_refresh_at=time.time() + 120,
+            )
+            _save(self.auth.path, data)
+        with patch("lazarus.chatgpt_auth.httpx.Client") as client:
+            self.assertEqual(self.auth.access_token(), "valid")
+            with self.auth.locked() as data:
+                data["accounts"]["default"]["expires_at"] = 0
+                _save(self.auth.path, data)
+            with self.assertRaisesRegex(ChatGPTError, "refresh_not_ready"):
+                self.auth.access_token()
+            client.assert_not_called()
 
     def test_login_callback_pkce_and_registration(self):
         captured = {}
@@ -303,6 +430,8 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
     async def provider(self, events, requests):
         def handler(request):
             requests.append(request)
+            if callable(events):
+                return events(request, len(requests))
             body = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
             return httpx.Response(
                 200, headers={"content-type": "text/event-stream"}, text=body
@@ -448,6 +577,221 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 stream = await provider.generate("instructions", [], [])
                 with self.assertRaises(ChatProviderError):
                     _ = [part async for part in stream]
+
+    async def test_retry_boundary_discards_partial_tools_and_preserves_history(self):
+        completed = {
+            "type": "response.completed",
+            "response": {"id": "response", "usage": None},
+        }
+        tool = {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "name": "python",
+                "namespace": "lazarus",
+                "call_id": "call",
+                "id": "item",
+                "arguments": '{"code":"work"}',
+            },
+        }
+
+        def sse(events):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text="".join("data: " + json.dumps(e) + "\n\n" for e in events),
+            )
+
+        class BrokenStream(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield ("data: " + json.dumps(tool) + "\n\n").encode()
+                raise httpx.ReadError("DO-NOT-PRINT")
+
+            async def aclose(self):
+                self.closed = True
+
+        for failure in (
+            "http",
+            "disconnect",
+            "stream_disconnect",
+            "truncated",
+            "server_event",
+        ):
+            with self.subTest(failure=failure):
+                requests, dispatched = [], []
+                broken = BrokenStream()
+
+                def handler(request, attempt):
+                    if attempt == 1:
+                        if failure == "http":
+                            return httpx.Response(
+                                503, json={"error": {"code": "server_error"}}
+                            )
+                        if failure == "disconnect":
+                            raise httpx.ReadError("DO-NOT-PRINT")
+                        if failure == "stream_disconnect":
+                            return httpx.Response(
+                                200,
+                                headers={"content-type": "text/event-stream"},
+                                stream=broken,
+                            )
+                        events = [
+                            tool,
+                            {
+                                "type": "response.output_text.delta",
+                                "delta": "discard me",
+                            },
+                        ]
+                        if failure == "server_event":
+                            events.append(
+                                {
+                                    "type": "response.failed",
+                                    "response": {"error": {"code": "server_error"}},
+                                }
+                            )
+                        return sse(events)
+                    return sse(
+                        [tool, completed]
+                        if attempt == 2
+                        else [
+                            {"type": "response.output_text.delta", "delta": "done"},
+                            completed,
+                        ]
+                    )
+
+                provider = await self.provider(handler, requests)
+
+                def handle(call):
+                    dispatched.append(call)
+                    return ToolResult(
+                        tool_call_id=call.id, return_value=ToolOk(output="result")
+                    )
+
+                history = []
+                with (
+                    patch(
+                        "lazarus.chatgpt_errors.asyncio.sleep", new_callable=AsyncMock
+                    ) as sleep,
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()),
+                ):
+                    await run_request(
+                        provider,
+                        SimpleNamespace(tools=[], handle=handle),
+                        SimpleNamespace(cwd="/app"),
+                        history,
+                        "task",
+                        TokenTotals(),
+                        200000,
+                        system_prompt="fixed",
+                    )
+                self.assertEqual(len(dispatched), 1)
+                self.assertEqual(len(requests), 3)
+                self.assertEqual(requests[0].content, requests[1].content)
+                self.assertEqual(len({r.headers["session-id"] for r in requests}), 1)
+                self.assertNotIn("discard me", str(history))
+                sleep.assert_awaited_once()
+                if failure == "stream_disconnect":
+                    self.assertTrue(broken.closed)
+
+    async def test_retry_limit_terminal_errors_and_cancellation(self):
+        for error, attempts in (
+            (ChatGPTError("inference", status=500), 3),
+            (
+                ChatGPTError(
+                    "inference",
+                    status=429,
+                    code="subscription_sharing_usage_limit_exceeded",
+                ),
+                1,
+            ),
+            (ChatGPTError("inference", status=401), 1),
+            (ChatGPTError("inference", code="max_output_tokens"), 1),
+            (asyncio.CancelledError(), 1),
+        ):
+            with (
+                self.subTest(error=str(error)),
+                patch("lazarus.chatgpt_errors.asyncio.sleep", new_callable=AsyncMock),
+                redirect_stderr(StringIO()),
+            ):
+                operation = AsyncMock(side_effect=error)
+                with self.assertRaises(type(error)):
+                    await retry_chatgpt(operation)
+                self.assertEqual(operation.await_count, attempts)
+        with (
+            patch(
+                "lazarus.chatgpt_errors.asyncio.sleep", new_callable=AsyncMock
+            ) as sleep,
+            redirect_stderr(StringIO()),
+        ):
+            sleep.side_effect = asyncio.CancelledError
+            operation = AsyncMock(side_effect=ChatGPTError("inference", status=500))
+            with self.assertRaises(asyncio.CancelledError):
+                await retry_chatgpt(operation)
+            operation.assert_awaited_once()
+
+    def test_retry_after_and_safe_diagnostics(self):
+        with redirect_stderr(StringIO()):
+            for header, expected in (
+                ("10", 10),
+                ("120", None),
+                ("Thu, 01 Jan 1970 00:00:10 GMT", 10),
+            ):
+                with patch("lazarus.chatgpt_errors.time.time", return_value=0):
+                    error = response_error(
+                        "inference",
+                        httpx.Response(
+                            429,
+                            json={"detail": "DO-NOT-PRINT"},
+                            headers={"retry-after": header},
+                        ),
+                    )
+                    self.assertEqual(retry_delay(error, 0), expected)
+                    self.assertNotIn("DO-NOT-PRINT", str(error))
+
+    async def test_session_id_survives_cli_resume_and_old_journals(self):
+        events = [
+            {"type": "response.output_text.delta", "delta": "done"},
+            {
+                "type": "response.completed",
+                "response": {"id": "response", "usage": None},
+            },
+        ]
+        requests = []
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            redirect_stdout(StringIO()),
+            patch("lazarus.cli._system_prompt", return_value="fixed"),
+        ):
+            path = str(Path(directory) / "session")
+            provider = await self.provider(events, requests)
+            await run(provider, "first", 200000, 48, session_dir=path)
+            provider = await self.provider(events, requests)
+            await run(provider, "second", 200000, 48, resume=path)
+            self.assertEqual(
+                requests[0].headers["session-id"], requests[1].headers["session-id"]
+            )
+            journal = Path(path) / "journal.jsonl"
+            journal.write_text(
+                "\n".join(
+                    line
+                    for line in journal.read_text().splitlines()
+                    if json.loads(line)["event"] != "chatgpt_session"
+                )
+                + "\n"
+            )
+            for prompt in ("third", "fourth"):
+                provider = await self.provider(events, requests)
+                await run(provider, prompt, 200000, 48, resume=path)
+            self.assertNotEqual(
+                requests[1].headers["session-id"], requests[2].headers["session-id"]
+            )
+            self.assertEqual(
+                requests[2].headers["session-id"], requests[3].headers["session-id"]
+            )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from lazarus.display import ToolDisplay, result_text
 from lazarus.jobs import DEFAULT_TOOL_OUTPUT_LIMIT_KIB, Jobs
 from lazarus.session import Session, pending_tool_calls
+from lazarus.chatgpt_errors import retry_chatgpt
 from lazarus.skills import skills_prompt
 from lazarus.runtime import (
     DEFAULT_CELL_TIMEOUT,
@@ -470,11 +471,13 @@ async def run_request(
 
     while True:
         append_completions()
-        step = await kosong.generate(
-            chat_provider=chat,
-            tools=toolset.tools,
-            history=history,
-            system_prompt=system_prompt,
+        step = await retry_chatgpt(
+            lambda: kosong.generate(
+                chat_provider=chat,
+                tools=toolset.tools,
+                history=history,
+                system_prompt=system_prompt,
+            )
         )
         token_totals.add(step.usage)
         if session:
@@ -574,6 +577,7 @@ async def run(
         ]
     )
     history: list[Message] = []
+    task = ""
     token_totals = TokenTotals()
     # Resume uses its original catalog and instructions from the journal.
     system_prompt = ""
@@ -672,11 +676,18 @@ async def run(
             history, task, system_prompt, cwd = session.restore()
             runtime.cwd = cwd
             runtime.initial_cwd = cwd
-            if prompt is None:
-                history = await request(task, continuation=True)
         else:
             system_prompt = _system_prompt(runtime.initial_cwd)
             session.record("session", system_prompt=system_prompt, cwd=runtime.cwd)
+        from lazarus.chatgpt import ChatGPT
+
+        if isinstance(chat, ChatGPT):
+            if session.chatgpt_session_id:
+                chat._session_id = session.chatgpt_session_id
+            else:
+                session.record("chatgpt_session", id=chat._session_id)
+        if resume and prompt is None:
+            history = await request(task, continuation=True)
         if prompt is not None:
             await request(prompt)
             return

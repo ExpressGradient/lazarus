@@ -23,6 +23,7 @@ def pending_tool_calls(history: list[Message]) -> dict[str, ToolCall]:
 
 class Session:
     def __init__(self, directory: str | None, *, resume: bool = False) -> None:
+        self.chatgpt_session_id: str | None = None
         if directory is None:
             name = (
                 datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid4().hex[:8]
@@ -76,6 +77,8 @@ class Session:
         cwd = ""
         for event in self._events():
             match event["event"]:
+                case "chatgpt_session":
+                    self.chatgpt_session_id = event["id"]
                 case "session":
                     system_prompt, cwd = event["system_prompt"], event["cwd"]
                 case "request":
